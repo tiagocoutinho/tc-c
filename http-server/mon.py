@@ -29,6 +29,8 @@ class MyEventHandler(FileSystemEventHandler):
         task.start()
 
     def make_and_run(self):
+        clear_screen = '\033[2J\033[H'
+        print(clear_screen);
         print("compiling...")
         if subprocess.call(["gcc", "-o", "httpd", "httpd.c"]):
             self.state = "waiting"
