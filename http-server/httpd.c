@@ -8,10 +8,29 @@
 #define LISTEN_BACKLOG 50
 #define MAX_EVENTS 10
 
+#define log(...) fprintf(stderr, __VA_ARGS__)
+
 typedef struct sockaddr Addr;
 typedef struct sockaddr_in InetAddr;
 
 typedef struct epoll_event Event;
+
+// Str -----------------------------------------------------------------------
+typedef struct {
+  size_t size;
+  const char *data;
+} Str;
+
+#define STR(cstr) ((Str){.size = sizeof(cstr) - 1, .data = cstr})
+#define STR_Fmt "%.*s"
+#define STR_Arg(s) (int)(s).size, (s).data
+
+#define NL "\r\n"
+
+// HTTP
+char S200 = 200;
+
+// Server --------------------------------------------------------------------
 
 typedef struct {
   int sock_fd;
@@ -89,9 +108,10 @@ int Server_accept(Server *s) {
   InetAddr client_addr;
   socklen_t client_addr_len = sizeof(client_addr);
   int client_fd = accept(s->sock_fd, (Addr *)&client_addr, &client_addr_len);
-  char name[128];
-  inet_ntop(AF_INET, &client_addr.sin_addr, name, 128);
-  printf("Received connection from %s %d\n", name, client_addr.sin_port);
+  char buf[128];
+  Str name = STR(inet_ntop(AF_INET, &client_addr.sin_addr, buf, 128));
+  printf("Received connection from " STR_Fmt " %d\n", STR_Arg(name),
+         client_addr.sin_port);
   return client_fd;
 }
 
@@ -100,30 +120,43 @@ int Server_wait(Server *s) {
 }
 
 int Server_add_client(Server *s, int fd) {
+  log("adding new client (%d)\n", s->nb_clients + 1);
   Event event = {.events = EPOLLIN, .data = {.fd = fd}};
   if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, fd, &event) == -1) {
     return -1;
   }
+  s->nb_clients++;
   return 0;
 }
 
 int Server_remove_client(Server *s, int fd) {
+  log("removing client (%d)\n", s->nb_clients - 0);
   if (epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, fd, NULL) == -1) {
     return -1;
   }
+  s->nb_clients--;
   return 0;
 }
 
 int Server_handle_request(Server *s, int fd) {
-  char buf[4096] = {0};
-  int n = recv(fd, buf, 4096, 0);
-  if (n == 0) {
-    Server_remove_client(s, fd);
-    close(fd);
+  char read_buf[4096];
+  char write_buf[4096];
+  int n = recv(fd, read_buf, 4096, 0);
+  if (n <= 0) {
     return -1;
-  } else {
-    printf("received '%s'\n", buf);
   }
+  Str content = STR("<html>"
+                    "<head><link rel=\"icon\" href=\"data:,\" /></head>"
+                    "<body><h0>Hello, world!</h1></body>"
+                    "</html>");
+  char status = S200;
+  Str status_msg = STR("OK");
+  n = sprintf(write_buf,
+              "HTTP/1.1 200 OK" NL "Content-Type: text/html" NL
+              "Content-Length: %ld" NL NL STR_Fmt,
+              content.size, STR_Arg(content));
+  send(fd, write_buf, n, 0);
+
   return 0;
 }
 
@@ -144,7 +177,10 @@ int Server_loop(Server *s) {
           return -1;
         }
       } else {
-        Server_handle_request(s, fd);
+        if (Server_handle_request(s, fd) == -1) {
+          Server_remove_client(s, fd);
+          close(fd);
+        }
       }
     }
   }
