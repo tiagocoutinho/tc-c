@@ -32,7 +32,7 @@ class MyEventHandler(FileSystemEventHandler):
         clear_screen = '\033[2J\033[H'
         print(clear_screen);
         print("compiling...")
-        if subprocess.call(["gcc", "-o", "httpd", "httpd.c"]):
+        if subprocess.call(["gcc", "-Wall", "-ansi", "-g", "-std=c11", "-o", "httpd", "httpd.c"]):
             self.state = "waiting"
             return
         self.state = "running"
@@ -41,6 +41,7 @@ class MyEventHandler(FileSystemEventHandler):
 
 
 event_handler = MyEventHandler()
+event_handler.start_make_and_run()
 observer = Observer()
 observer.schedule(event_handler, ".", recursive=False)
 observer.start()
