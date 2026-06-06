@@ -31,8 +31,8 @@ class MyEventHandler(FileSystemEventHandler):
     def make_and_run(self):
         clear_screen = '\033[2J\033[H'
         print(clear_screen);
-        print("compiling...")
-        if subprocess.call(["gcc", "-Wall", "-ansi", "-g", "-std=c11", "-o", "httpd", "httpd.c"]):
+        print("--- compiling... ---")
+        if subprocess.call(["gcc", "-Wall", "-ansi", "-g", "-std=c11", "-lrt", "-o", "httpd", "httpd.c"]):
             self.state = "waiting"
             return
         self.state = "running"

@@ -1,24 +1,43 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <arpa/inet.h>
+#include <bits/time.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdarg.h>
 #include <stdbool.h>
+#
+#include <netinet/tcp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LISTEN_BACKLOG 50
 #define MAX_EVENTS 10
 
-#define log(...) fprintf(stderr, __VA_ARGS__)
-
 typedef struct sockaddr Addr;
 typedef struct sockaddr_in InetAddr;
 
 typedef struct epoll_event Event;
+
+void elog(const char *format, ...) {
+  char time_buf[32];
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  struct tm *tm_info = localtime(&ts.tv_sec);
+  strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+  fprintf(stderr, "[%s.%06ld] ", time_buf, ts.tv_nsec / 1000);
+  va_list args;
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+}
 
 // Str -----------------------------------------------------------------------
 
@@ -91,6 +110,7 @@ const Str mime_html = SL("text/html");
 // Request -------------------------------------------------------------------
 //
 typedef struct {
+  Str status_line;
   Str method;
   Str path;
   Str protocol;
@@ -138,14 +158,32 @@ void Server_init(Server *server) {
   server->nb_clients = 0;
 }
 
+int isetsockopt(int fd, int level, int option, int value) {
+  return setsockopt(fd, level, option, &value, sizeof(value));
+}
+
+int Server_prepare_tcp_socket(int fd) {
+  if (isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1) == -1) {
+    return -1;
+  }
+  int flags = fcntl(fd, F_GETFL, 0);
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 int Server_create_tcp(Server *server, const char *host, int port) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd == -1) {
     return -1;
   }
+
   server->sock_fd = fd;
-  const int reuse = 1;
-  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(int)) == -1) {
+
+  if (isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1) == -1) {
+    close(fd);
+    return -1;
+  }
+
+  if (Server_prepare_tcp_socket(fd) == -1) {
     close(fd);
     return -1;
   }
@@ -201,12 +239,16 @@ void Server_stop(Server *s) {
 int Server_accept(Server *s) {
   InetAddr client_addr;
   socklen_t client_addr_len = sizeof(client_addr);
-  int client_fd = accept(s->sock_fd, (Addr *)&client_addr, &client_addr_len);
+  int fd = accept(s->sock_fd, (Addr *)&client_addr, &client_addr_len);
+  if (Server_prepare_tcp_socket(fd) == -1) {
+    return -1;
+  }
   char buf[128];
-  Str name = str_from_c0(inet_ntop(AF_INET, &client_addr.sin_addr, buf, 128));
-  printf("Received connection from " STR_Fmt " %d\n", STR_Arg(name),
-         client_addr.sin_port);
-  return client_fd;
+  Str name =
+      str_from_c0(inet_ntop(AF_INET, &client_addr.sin_addr, buf, sizeof(buf)));
+  elog("Received connection from " STR_Fmt " %d\n", STR_Arg(name),
+       client_addr.sin_port);
+  return fd;
 }
 
 int Server_wait(Server *s) {
@@ -214,7 +256,7 @@ int Server_wait(Server *s) {
 }
 
 int Server_add_client(Server *s, int fd) {
-  log("adding new client (%d)\n", s->nb_clients + 1);
+  elog("adding new client (%d)\n", s->nb_clients + 1);
   Event event = {.events = EPOLLIN, .data = {.fd = fd}};
   if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, fd, &event) == -1) {
     return -1;
@@ -224,7 +266,7 @@ int Server_add_client(Server *s, int fd) {
 }
 
 int Server_remove_client(Server *s, int fd) {
-  log("removing client (%d)\n", s->nb_clients - 1);
+  elog("removing client (%d)\n", s->nb_clients - 1);
   if (epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, fd, NULL) == -1) {
     return -1;
   }
@@ -233,19 +275,43 @@ int Server_remove_client(Server *s, int fd) {
 }
 
 Request Request_parse(const Str payload) {
-  Str status_line = str_subc(payload, '\r');
-  Request req = {
-      .method = str_subc(status_line, ' '),
-  };
-  status_line = str_chop_left(status_line, req.method.size + 1);
+  // GET /path HTTP/1.1
+  Request req = {.status_line = str_subc(payload, '\r')};
+  req.method = str_subc(req.status_line, ' ');
+  Str status_line = str_chop_left(req.status_line, req.method.size + 1);
   req.path = str_subc(status_line, ' ');
   req.protocol = str_chop_left(status_line, req.path.size + 1);
   return req;
 }
 
 void Request_log(const Request req) {
-  log(STR_Fmt "|" STR_Fmt "|" STR_Fmt "\n", STR_Arg(req.method),
-      STR_Arg(req.path), STR_Arg(req.protocol));
+  elog(STR_Fmt " " STR_Fmt "|" STR_Fmt "\n", STR_Arg(req.method),
+       STR_Arg(req.path), STR_Arg(req.protocol));
+}
+
+Str time_delta(const struct timespec *start, const struct timespec *end,
+               char *buf, size_t bufsize) {
+  struct timespec delta;
+
+  delta.tv_sec = end->tv_sec - start->tv_sec;
+  delta.tv_nsec = end->tv_nsec - start->tv_nsec;
+
+  long seconds = delta.tv_sec;
+  long ms = delta.tv_nsec / 1000000L;
+  long us = (delta.tv_nsec % 1000000L) / 1000L;
+  long ns = delta.tv_nsec % 1000L;
+
+  int n;
+  if (seconds > 0) {
+    n = snprintf(buf, bufsize, "%ld.%03ld s", seconds, ms);
+  } else if (ms > 0) {
+    n = snprintf(buf, bufsize, "%ld.%03ld ms", us, ns / 1);
+  } else if (us > 0) {
+    n = snprintf(buf, bufsize, "%ld.%03ld us", us, ns / 1);
+  } else {
+    n = snprintf(buf, bufsize, "%ld ns", ns);
+  }
+  return str_from_parts(buf, n);
 }
 
 int Server_handle_request(Server *s, int fd) {
@@ -259,10 +325,18 @@ int Server_handle_request(Server *s, int fd) {
   const Str payload = str_from_parts(read_buf, n);
   Request req = Request_parse(payload);
   req.fd = fd;
-  Request_log(req);
 
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  elog("[START] " STR_Fmt "\n", STR_Arg(req.status_line));
   RequestHandler func = Router_find(&s->router, req.path);
-  return func(&req);
+  int result = func(&req);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  char buf[32];
+  Str dt = time_delta(&start, &end, buf, sizeof(buf));
+  elog("[ END ] " STR_Fmt " " STR_Fmt "\n", STR_Arg(req.status_line),
+       STR_Arg(dt));
+  return result;
 }
 
 int Server_handle(Server *s, int n) {
@@ -353,14 +427,6 @@ int send_file(int dst, const char *filename, Status status, Str content_type) {
 
 int about_page(Request *request) {
   return send_file(request->fd, "about.html", S200, mime_html);
-  //  int src_fd = open("./about.html", 0, O_RDONLY);
-  //  if (src_fd == -1) {
-  //    return -1;
-  //  }
-  //  struct stat s;
-  //  fstat(src_fd, &s);
-  //  send_header(request->fd, S200, mime_html, s.st_size);
-  //  return sendfile(request->fd, src_fd, NULL, s.st_size) == -1 ? -1 : 0;
 }
 
 int home_page(Request *request) {
@@ -381,7 +447,7 @@ int not_found(Request *request) {
 }
 
 int main(int argc, char **argv) {
-  printf("Starting httpd...\n");
+  elog("Starting httpd...\n");
 
   Server serv;
   Server_init(&serv);
@@ -401,10 +467,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  printf("Ready to receive requests\n");
+  elog("Ready to receive requests\n");
   Server_loop(&serv);
   Server_stop(&serv);
-  printf("Finished httpd\n");
+  elog("Finished httpd\n");
 
   return 0;
 }
