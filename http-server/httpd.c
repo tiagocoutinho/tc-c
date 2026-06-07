@@ -19,6 +19,7 @@
 
 #define LISTEN_BACKLOG 50
 #define MAX_EVENTS 10
+#define MAX_HEADERS 20
 
 typedef struct sockaddr Addr;
 typedef struct sockaddr_in InetAddr;
@@ -91,6 +92,24 @@ Str str_subc(Str str, char c) {
   return str;
 }
 
+bool str_indexstr(Str str, Str sub, size_t *index) {
+  for (size_t i = 0; i < (str.size - sub.size + 1); ++i) {
+    if (memcmp(str.data + i, sub.data, sub.size) == 0) {
+      *index = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+Str str_substr(Str str, Str sub) {
+  size_t index;
+  if (str_indexstr(str, sub, &index)) {
+    return str_from_parts(str.data, index);
+  }
+  return str;
+}
+
 Str str_chop_left(Str str, size_t n) {
   if (n > str.size) {
     n = str.size;
@@ -104,6 +123,26 @@ Str str_chop_left(Str str, size_t n) {
 bool str_eq(Str a, Str b) {
   return (a.size != b.size) ? false : memcmp(a.data, b.data, a.size) == 0;
 }
+
+Str str_trim_left(Str str) {
+  size_t i = 0, n = str.size;
+  while (i < n && str.data[i] == ' ') {
+    i += 1;
+  }
+
+  return str_from_parts(str.data + i, n - i);
+}
+
+Str str_trim_right(Str str) {
+  size_t i = 0, n = str.size;
+  while (i < n && str.data[n - 1 - i] == ' ') {
+    i += 1;
+  }
+
+  return str_from_parts(str.data, n - i);
+}
+
+Str str_trim(Str str) { return str_trim_right(str_trim_left(str)); }
 
 // HTTP ----------------------------------------------------------------------
 
@@ -120,10 +159,19 @@ typedef struct {
 const Status S200 = {s200, SL("OK")};
 const Status S404 = {s404, SL("Not found")};
 const Str mime_html = SL("text/html");
+const Str hb_sep = SL("\r\n\r\n");
+
+// Header --------------------------------------------------------------------
+
+typedef struct {
+  Str name;
+  Str value;
+} Header;
 
 // Request -------------------------------------------------------------------
-//
+
 typedef struct {
+  Str payload;
   Str status_line;
   Str method;
   Str path;
@@ -231,14 +279,53 @@ int Server_remove_client(Server *s, int fd) {
   return 0;
 }
 
-Request Request_parse(const Str payload) {
+Request Request_new(const Str payload) {
   // GET /path HTTP/1.1
-  Request req = {.status_line = str_subc(payload, '\r')};
+  size_t sl_index;
+  str_index(payload, '\r', &sl_index);
+  Request req = {.payload = payload,
+                 .status_line = str_from_parts(payload.data, sl_index)};
   req.method = str_subc(req.status_line, ' ');
   Str status_line = str_chop_left(req.status_line, req.method.size + 1);
   req.path = str_subc(status_line, ' ');
   req.protocol = str_chop_left(status_line, req.path.size + 1);
+
   return req;
+}
+
+Str Request_header(Request *req) {
+  size_t start = req->status_line.size + 2;
+  Str rest =
+      str_from_parts(req->payload.data + start, req->payload.size - (start));
+  size_t hb_index;
+  str_indexstr(rest, hb_sep, &hb_index);
+  return str_from_parts(rest.data, hb_index);
+}
+
+int Request_headers(Request *req, Header *headers, size_t max) {
+  Str header = Request_header(req);
+  size_t index, sep;
+  for (int i = 0; i < max; ++i) {
+    if (str_index(header, '\r', &index) == false) {
+      return i;
+    }
+    Str line = str_from_parts(header.data, index);
+    str_index(line, ':', &sep);
+    Str value = str_from_parts(line.data + sep + 1, line.size - (sep + 1));
+    value = str_trim(value);
+    headers[i] =
+        (Header){.name = str_from_parts(line.data, sep), .value = value};
+    header = str_from_parts(header.data + line.size + 2,
+                            header.size - (line.size + 2));
+  }
+  return 0;
+}
+
+Str Request_body(Request *req) {
+  size_t hb_index;
+  str_indexstr(req->payload, hb_sep, &hb_index);
+  size_t start = hb_index + hb_sep.size;
+  return str_from_parts(req->payload.data + start, req->payload.size - start);
 }
 
 Str time_delta(const struct timespec *start, const struct timespec *end,
@@ -274,7 +361,7 @@ int Server_handle_request(Server *s, int fd) {
     return -2;
   }
   const Str payload = str_from_parts(rbuf, n);
-  Request req = Request_parse(payload);
+  Request req = Request_new(payload);
   req.fd = fd;
 
   struct timespec start, end;
@@ -348,6 +435,7 @@ int send_file(int dst, const char *filename, Status status, Str content_type) {
   TRY_CATCH(send_header(dst, status, content_type, s.st_size), close(src_fd));
   TRY_CATCH(result = sendfile(dst, src_fd, NULL, s.st_size) == -1 ? -1 : 0,
             close(src_fd));
+  close(src_fd);
   return result;
 }
 
@@ -360,7 +448,6 @@ int home_page(Request *request) {
                     "<head><link rel=\"icon\" href=\"data:,\" /></head>"
                     "<body><h1>Hello, world!</h1></body>"
                     "</html>");
-
   return send_static(request->fd, S200, mime_html, content);
 }
 
@@ -370,6 +457,28 @@ int not_found(Request *request) {
                     "<body><h1>404 Not found</h1></body>"
                     "</html>");
   return send_static(request->fd, S404, mime_html, content);
+}
+
+int debug_page(Request *request) {
+  Str content = STR("<html>"
+                    "<head><link rel=\"icon\" href=\"data:,\" /></head>"
+                    "<body><h1>Hello, world!</h1></body>"
+                    "</html>");
+  Str header = Request_header(request);
+  Str body = Request_body(request);
+  printf("HEADER='" STR_Fmt "'\nBODY='" STR_Fmt "'\n", STR_Arg(header),
+         STR_Arg(body));
+
+  Header headers[100];
+  int n = Request_headers(request, headers, 100);
+  for (int i = 0; i < n; ++i) {
+    printf("H '" STR_Fmt "' = '" STR_Fmt "'\n", STR_Arg(headers[i].name),
+           STR_Arg(headers[i].value));
+  }
+  return send_static(request->fd, S200, mime_html, content);
+}
+int info_page(Request *request) {
+  return send_static(request->fd, S200, mime_html, request->payload);
 }
 
 int main(int argc, char **argv) {
@@ -382,8 +491,10 @@ int main(int argc, char **argv) {
           (Route[]){
               {.handler = home_page, .path = STR("/")},
               {.handler = about_page, .path = STR("/about")},
+              {.handler = debug_page, .path = STR("/debug")},
+              {.handler = info_page, .path = STR("/info")},
           },
-      .size = 2,
+      .size = 4,
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
 
