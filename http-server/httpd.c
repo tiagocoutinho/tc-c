@@ -1,13 +1,12 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <bits/time.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdarg.h>
 #include <stdbool.h>
-#
-#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +37,21 @@ void elog(const char *format, ...) {
   vfprintf(stderr, format, args);
   va_end(args);
 }
+
+int isetsockopt(int fd, int level, int option, int value) {
+  return setsockopt(fd, level, option, &value, sizeof(value));
+}
+
+#define TRY(stmt)                                                              \
+  if ((stmt) == -1) {                                                          \
+    return -1;                                                                 \
+  }
+
+#define TRY_CATCH(stmt, catch)                                                 \
+  if ((stmt) == -1) {                                                          \
+    catch;                                                                     \
+    return -1;                                                                 \
+  }
 
 // Str -----------------------------------------------------------------------
 
@@ -146,86 +160,40 @@ RequestHandler Router_find(Router *router, Str path) {
 typedef struct {
   int sock_fd;
   int epoll_fd;
-  Event events[MAX_EVENTS];
-  int nb_clients;
 
   Router router;
 } Server;
 
-void Server_init(Server *server) {
-  server->sock_fd = 0;
-  server->epoll_fd = 0;
-  server->nb_clients = 0;
-}
-
-int isetsockopt(int fd, int level, int option, int value) {
-  return setsockopt(fd, level, option, &value, sizeof(value));
-}
-
-int Server_prepare_tcp_socket(int fd) {
-  if (isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1) == -1) {
-    return -1;
-  }
-  int flags = fcntl(fd, F_GETFL, 0);
-  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
+Server Server_new() { return (Server){.sock_fd = 0, .epoll_fd = 0}; }
 
 int Server_create_tcp(Server *server, const char *host, int port) {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd == -1) {
-    return -1;
-  }
-
-  server->sock_fd = fd;
-
-  if (isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1) == -1) {
-    close(fd);
-    return -1;
-  }
-
-  if (Server_prepare_tcp_socket(fd) == -1) {
-    close(fd);
-    return -1;
-  }
-
+  int fd, epoll_fd;
   struct in_addr sin_addr;
-  if (inet_pton(AF_INET, host, &sin_addr) != 1) {
-    close(fd);
-    return -1;
-  }
+
+  TRY(fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+  TRY_CATCH(isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1), close(fd));
+  TRY_CATCH(isetsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1), close(fd));
+  TRY_CATCH(isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
+  TRY_CATCH(inet_pton(AF_INET, host, &sin_addr), close(fd));
 
   InetAddr addr = {
       .sin_family = AF_INET, .sin_port = htons(port), .sin_addr = sin_addr};
 
-  if (bind(fd, (Addr *)&addr, sizeof(addr)) == -1) {
-    close(fd);
-    return -1;
-  }
+  TRY_CATCH(bind(fd, (Addr *)&addr, sizeof(addr)), close(fd));
+  TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
+  TRY_CATCH(epoll_fd = epoll_create1(0), close(fd));
 
-  if (listen(fd, LISTEN_BACKLOG) == -1) {
-    close(fd);
-    return -1;
-  }
-
-  const int epoll_fd = epoll_create1(0);
-  if (epoll_fd == -1) {
-    close(fd);
-    return -1;
-  }
-
-  server->epoll_fd = epoll_fd;
   Event event = {.events = EPOLLIN, .data = {.fd = fd}};
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) == -1) {
+  TRY_CATCH(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event), {
     close(epoll_fd);
     close(fd);
-
-    return -1;
-  }
-
+  });
+  server->sock_fd = fd;
+  server->epoll_fd = epoll_fd;
   return 0;
 }
 
-void Server_stop(Server *s) {
+void Server_close(Server *s) {
   if (s->epoll_fd > 0) {
     close(s->epoll_fd);
     s->epoll_fd = 0;
@@ -237,40 +205,29 @@ void Server_stop(Server *s) {
 }
 
 int Server_accept(Server *s) {
-  InetAddr client_addr;
-  socklen_t client_addr_len = sizeof(client_addr);
-  int fd = accept(s->sock_fd, (Addr *)&client_addr, &client_addr_len);
-  if (Server_prepare_tcp_socket(fd) == -1) {
-    return -1;
-  }
+  int fd, flags;
+  InetAddr addr;
+  socklen_t addr_len = sizeof(addr);
+  TRY(fd = accept(s->sock_fd, (Addr *)&addr, &addr_len));
+  TRY(flags = fcntl(fd, F_GETFL, 0));
+  TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
   char buf[128];
-  Str name =
-      str_from_c0(inet_ntop(AF_INET, &client_addr.sin_addr, buf, sizeof(buf)));
+  Str name = str_from_c0(inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)));
   elog("Received connection from " STR_Fmt " %d\n", STR_Arg(name),
-       client_addr.sin_port);
+       addr.sin_port);
   return fd;
 }
 
-int Server_wait(Server *s) {
-  return epoll_wait(s->epoll_fd, s->events, MAX_EVENTS, -1);
-}
-
 int Server_add_client(Server *s, int fd) {
-  elog("adding new client (%d)\n", s->nb_clients + 1);
+  elog("adding new client\n");
   Event event = {.events = EPOLLIN, .data = {.fd = fd}};
-  if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, fd, &event) == -1) {
-    return -1;
-  }
-  s->nb_clients++;
+  TRY(epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, fd, &event));
   return 0;
 }
 
 int Server_remove_client(Server *s, int fd) {
-  elog("removing client (%d)\n", s->nb_clients - 1);
-  if (epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, fd, NULL) == -1) {
-    return -1;
-  }
-  s->nb_clients--;
+  elog("removing client\n");
+  TRY(epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, fd, NULL));
   return 0;
 }
 
@@ -282,11 +239,6 @@ Request Request_parse(const Str payload) {
   req.path = str_subc(status_line, ' ');
   req.protocol = str_chop_left(status_line, req.path.size + 1);
   return req;
-}
-
-void Request_log(const Request req) {
-  elog(STR_Fmt " " STR_Fmt "|" STR_Fmt "\n", STR_Arg(req.method),
-       STR_Arg(req.path), STR_Arg(req.protocol));
 }
 
 Str time_delta(const struct timespec *start, const struct timespec *end,
@@ -315,14 +267,13 @@ Str time_delta(const struct timespec *start, const struct timespec *end,
 }
 
 int Server_handle_request(Server *s, int fd) {
-  char read_buf[4096];
-  int n = recv(fd, read_buf, 4096, 0);
-  if (n == -1) {
-    return -1;
-  } else if (n == 0) {
+  char rbuf[16 * 1024], lbuf[32];
+  int n;
+  TRY(n = recv(fd, rbuf, sizeof(rbuf), 0));
+  if (n == 0) {
     return -2;
   }
-  const Str payload = str_from_parts(read_buf, n);
+  const Str payload = str_from_parts(rbuf, n);
   Request req = Request_parse(payload);
   req.fd = fd;
 
@@ -332,56 +283,41 @@ int Server_handle_request(Server *s, int fd) {
   RequestHandler func = Router_find(&s->router, req.path);
   int result = func(&req);
   clock_gettime(CLOCK_MONOTONIC, &end);
-  char buf[32];
-  Str dt = time_delta(&start, &end, buf, sizeof(buf));
+  Str dt = time_delta(&start, &end, lbuf, sizeof(lbuf));
   elog("[ END ] " STR_Fmt " " STR_Fmt "\n", STR_Arg(req.status_line),
        STR_Arg(dt));
   return result;
 }
 
-int Server_handle(Server *s, int n) {
-  for (int i = 0; i < n; ++i) {
-    int fd = s->events[i].data.fd;
-    if (fd == s->sock_fd) {
-      int client_fd = Server_accept(s);
-      if (client_fd == -1) {
-        return -1;
-      }
-      if (Server_add_client(s, client_fd) == -1) {
-        return -1;
-      }
-    } else {
-      const int result = Server_handle_request(s, fd);
-      if (result < 0) {
-        if (result == -1) {
-          perror("Handle error");
-        }
-        Server_remove_client(s, fd);
-        close(fd);
-      }
-    }
-  }
-  return 0;
-}
-
 int Server_loop(Server *s) {
+  Event events[MAX_EVENTS];
   while (1) {
-    int n = Server_wait(s);
-    if (n == -1) {
-      return -1;
-    }
-    if (Server_handle(s, n) == -1) {
-      return -1;
+    int n;
+    TRY(n = epoll_wait(s->epoll_fd, events, MAX_EVENTS, -1));
+    for (int i = 0; i < n; ++i) {
+      int fd = events[i].data.fd;
+      if (fd == s->sock_fd) {
+        int client_fd;
+        TRY(client_fd = Server_accept(s));
+        TRY(Server_add_client(s, client_fd));
+      } else {
+        const int result = Server_handle_request(s, fd);
+        if (result < 0) {
+          if (result == -1) {
+            perror("Handle error");
+          }
+          Server_remove_client(s, fd);
+          close(fd);
+        }
+      }
     }
   }
 }
 
 int send_all(int fd, const char *payload, int n) {
+  int i;
   while (n > 0) {
-    int i = send(fd, payload, n, 0);
-    if (i == -1) {
-      return -1;
-    }
+    TRY(i = send(fd, payload, n, 0));
     payload += i;
     n -= i;
   }
@@ -400,28 +336,18 @@ int send_header(int fd, Status status, Str content_type, size_t content_size) {
 }
 
 int send_static(int fd, Status status, Str content_type, Str content) {
-  if (send_header(fd, status, content_type, content.size) == -1) {
-    return -1;
-  }
+  TRY(send_header(fd, status, content_type, content.size));
   return send_all(fd, content.data, content.size);
 }
 
 int send_file(int dst, const char *filename, Status status, Str content_type) {
-  int src_fd = open(filename, 0, O_RDONLY);
-  if (src_fd == -1) {
-    return -1;
-  }
+  int src_fd, result;
   struct stat s;
-  if (fstat(src_fd, &s) == -1) {
-    close(src_fd);
-    return -1;
-  }
-  if (send_header(dst, status, content_type, s.st_size) == -1) {
-    close(src_fd);
-    return -1;
-  }
-  int result = sendfile(dst, src_fd, NULL, s.st_size) == -1 ? -1 : 0;
-  close(src_fd);
+  TRY(src_fd = open(filename, 0, O_RDONLY));
+  TRY_CATCH(fstat(src_fd, &s), close(src_fd))
+  TRY_CATCH(send_header(dst, status, content_type, s.st_size), close(src_fd));
+  TRY_CATCH(result = sendfile(dst, src_fd, NULL, s.st_size) == -1 ? -1 : 0,
+            close(src_fd));
   return result;
 }
 
@@ -449,8 +375,7 @@ int not_found(Request *request) {
 int main(int argc, char **argv) {
   elog("Starting httpd...\n");
 
-  Server serv;
-  Server_init(&serv);
+  Server serv = Server_new();
 
   serv.router = (Router){
       .routes =
@@ -462,14 +387,12 @@ int main(int argc, char **argv) {
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
 
-  if (Server_create_tcp(&serv, "127.0.0.1", 3210) == -1) {
-    perror("create tcp error");
-    return 1;
-  }
+  TRY_CATCH(Server_create_tcp(&serv, "127.0.0.1", 3210),
+            perror("create tcp error"));
 
   elog("Ready to receive requests\n");
   Server_loop(&serv);
-  Server_stop(&serv);
+  Server_close(&serv);
   elog("Finished httpd\n");
 
   return 0;
