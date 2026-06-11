@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -31,14 +32,17 @@ typedef struct epoll_event Event;
 
 void elog(const char *format, ...) {
   char time_buf[32];
+  pthread_t th = pthread_self();
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   struct tm *tm_info = localtime(&ts.tv_sec);
   strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
-  fprintf(stderr, "[%s.%06ld] ", time_buf, ts.tv_nsec / 1000);
+  char buf[512];
+  snprintf(buf, sizeof(buf), "[%s.%06ld] [%lu] %s", time_buf, ts.tv_nsec / 1000,
+           (unsigned long)th, format);
   va_list args;
-  va_start(args, format);
-  vfprintf(stderr, format, args);
+  va_start(args, buf);
+  vfprintf(stderr, buf, args);
   va_end(args);
 }
 
