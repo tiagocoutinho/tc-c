@@ -611,7 +611,7 @@ int info_page(Request *request) {
   return send_static(request, S200, MIME_HTML, response);
 }
 
-int main(int argc, char **argv) {
+int run(Address addr) {
   elog("Starting httpd...\n");
 
   Server serv;
@@ -628,9 +628,6 @@ int main(int argc, char **argv) {
   };
 
   Connection conn;
-  // Address addr = Address_inet(STR("127.0.0.1"), 3210);
-  //  Address addr = Address_unix(STR("/tmp/httpd.sock"));
-  Address addr = Address_url(STR("tcp://127.0.0.1:3210"));
   TRY_CATCH(Connection_connect(&conn, addr), perror("Connect"));
   TRY_CATCH(Server_init(&serv, conn), perror("Server init"));
 
@@ -638,6 +635,22 @@ int main(int argc, char **argv) {
   Server_loop(&serv);
   Server_close(&serv);
   elog("Finished httpd\n");
-
   return 0;
+}
+
+void *run_thread(void *data) {
+  run(*(Address *)data);
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  // Address addr = Address_inet(STR("127.0.0.1"), 3210);
+  //  Address addr = Address_unix(STR("/tmp/httpd.sock"));
+  Address addr = Address_url(STR("tcp://127.0.0.1:3210"));
+
+  pthread_t threads[3];
+  for (int i = 0; i < 1; ++i) {
+    pthread_create(&threads[i], NULL, run_thread, &addr);
+  }
+  return run(addr);
 }
