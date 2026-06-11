@@ -186,7 +186,7 @@ Address Address_url(Str url) {
     return Address_unix(path);
   }
   url = str_trim_left(url, tcp.size);
-  size_t index;
+  size_t index = 0;
   str_index(url, ':', &index);
   const Str host = str_from_parts(url.data, index);
   const int port = atoi(url.data + index + 1);
@@ -550,8 +550,8 @@ int send_file(Request *req, const char *filename, Status status,
 
 int about_page(Request *request) {
   Header headers[100];
-  Request_headers(request, headers, sizeof(headers));
-  Str etag = Headers_get_header(headers, sizeof(headers), SL("If-None-Match"));
+  int n = Request_headers(request, headers, 100);
+  Str etag = Headers_get_header(headers, n, SL("If-None-Match"));
   return send_file(request, "about.html", S200, MIME_HTML, etag);
 }
 
@@ -583,7 +583,7 @@ int debug_page(Request *request) {
          STR_Arg(body));
 
   Header headers[100];
-  int n = Request_headers(request, headers, sizeof(headers));
+  int n = Request_headers(request, headers, 100);
   for (int i = 0; i < n; ++i) {
     printf("H '" STR_Fmt "' = '" STR_Fmt "'\n", STR_Arg(headers[i].name),
            STR_Arg(headers[i].value));
@@ -596,7 +596,7 @@ int info_page(Request *request) {
   char buf[N];
 
   Header headers[100];
-  int n = Request_headers(request, headers, sizeof(headers));
+  int n = Request_headers(request, headers, 100);
   int size =
       snprintf(buf, N, "<p>" STR_Fmt "</p>", STR_Arg(request->status_line));
   for (int i = 0; i < n; ++i) {
