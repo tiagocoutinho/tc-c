@@ -142,6 +142,93 @@ Str str_strip_right(Str str) {
 
 Str str_strip(Str str) { return str_strip_right(str_strip_left(str)); }
 
+// Connection ----------------------------------------------------------------
+
+typedef struct {
+  int domain;
+  union {
+    InetAddr inet;
+    UnixAddr unix;
+  } addr;
+  int fd;
+
+} Connection;
+
+int Connection_connect(Connection *conn) {
+  int fd;
+  TRY(fd = socket(conn->domain, SOCK_STREAM | SOCK_NONBLOCK, 0));
+  conn->fd = fd;
+  if (conn->domain == AF_UNIX) {
+    unlink(conn->addr.unix.sun_path);
+    TRY_CATCH(bind(fd, (Addr *)&conn->addr.unix, sizeof(conn->addr.unix)),
+              close(fd));
+    TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
+  } else {
+    TRY_CATCH(isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1), close(fd));
+    TRY_CATCH(isetsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1), close(fd));
+    TRY_CATCH(isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
+    TRY_CATCH(bind(fd, (Addr *)&conn->addr.inet, sizeof(conn->addr.inet)),
+              close(fd));
+    TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
+  }
+  return 0;
+}
+
+int Connection_accept(Connection *conn) {
+  int fd, flags;
+  if (conn->domain == AF_UNIX) {
+    UnixAddr addr;
+    socklen_t addr_len = sizeof(addr);
+    TRY(fd = accept(conn->fd, (Addr *)&addr, &addr_len));
+    TRY(flags = fcntl(fd, F_GETFL, 0));
+    TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+    Str name = str_from_c0(addr.sun_path);
+    elog("Received connection from " STR_Fmt "\n", STR_Arg(name));
+  } else {
+    InetAddr addr;
+    socklen_t addr_len = sizeof(conn->addr.inet);
+    TRY(fd = accept(conn->fd, (Addr *)&conn->addr.inet, &addr_len));
+    TRY(flags = fcntl(fd, F_GETFL, 0));
+    TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+    TRY_CATCH(isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
+    char buf[128];
+    Str name =
+        str_from_c0(inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)));
+    elog("Received connection from " STR_Fmt " %d\n", STR_Arg(name),
+         addr.sin_port);
+  }
+  return fd;
+}
+
+Connection Connection_inet(Str host, int port) {
+  Connection conn = {
+      .domain = AF_INET,
+      .fd = -1,
+  };
+  struct in_addr sin_addr;
+  if (inet_pton(AF_INET, host.data, &sin_addr) == -1) {
+    return conn;
+  };
+
+  InetAddr addr = {
+      .sin_family = AF_INET, .sin_port = htons(port), .sin_addr = sin_addr};
+  conn.addr.inet = addr;
+  return conn;
+}
+
+Connection Connection_unix(Str path) {
+  Connection conn = {.domain = AF_UNIX, .fd = -1};
+  memset(&conn.addr.unix, 0, sizeof(conn.addr.unix));
+  conn.addr.unix.sun_family = AF_UNIX;
+  strncpy(conn.addr.unix.sun_path, path.data, path.size);
+  return conn;
+}
+
+void Connection_close(Connection *conn) {
+  close(conn->fd);
+  conn->fd = -1;
+}
+
 // HTTP ----------------------------------------------------------------------
 
 typedef enum {
@@ -207,96 +294,29 @@ RequestHandler Router_find(Router *router, Str path) {
 // Server --------------------------------------------------------------------
 
 typedef struct {
-  int sock_fd;
+  Connection connection;
   int epoll_fd;
 
   Router router;
 } Server;
 
-Server Server_new() {
-  int epoll_fd = epoll_create1(0);
-  return (Server){.sock_fd = 0, .epoll_fd = epoll_fd};
-}
-
-int Server_create_inet(Server *server, const char *host, int port) {
-  int fd;
-  struct in_addr sin_addr;
-
-  TRY(fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
-  TRY_CATCH(isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1), close(fd));
-  TRY_CATCH(isetsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1), close(fd));
-  TRY_CATCH(isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
-  TRY_CATCH(inet_pton(AF_INET, host, &sin_addr), close(fd));
-
-  InetAddr addr = {
-      .sin_family = AF_INET, .sin_port = htons(port), .sin_addr = sin_addr};
-
-  TRY_CATCH(bind(fd, (Addr *)&addr, sizeof(addr)), close(fd));
-  TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
-
-  Event event = {.events = EPOLLIN, .data = {.fd = fd}};
-  TRY_CATCH(epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, fd, &event),
-            { close(fd); });
-  server->sock_fd = fd;
-  return 0;
-}
-
-int Server_create_unix(Server *server, Str path) {
-  int fd;
-  struct sockaddr_un addr;
-  memset(&addr, 0, sizeof(addr));
-  TRY(fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0));
-  addr.sun_family = AF_UNIX, strncpy(addr.sun_path, path.data, path.size);
-
-  unlink(path.data);
-  TRY_CATCH(bind(fd, (Addr *)&addr, sizeof(addr)), close(fd));
-  TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
-
-  Event event = {.events = EPOLLIN, .data = {.fd = fd}};
-  TRY_CATCH(epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, fd, &event),
-            { close(fd); });
-
-  server->sock_fd = fd;
+int Server_init(Server *server, Connection conn) {
+  int epoll_fd;
+  TRY(epoll_fd = epoll_create1(0));
+  server->connection = conn;
+  server->epoll_fd = epoll_fd;
+  Event event = {.events = EPOLLIN, .data = {.fd = server->connection.fd}};
+  TRY_CATCH(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server->connection.fd, &event),
+            { close(epoll_fd); });
   return 0;
 }
 
 void Server_close(Server *s) {
-  if (s->sock_fd > 0) {
-    close(s->sock_fd);
-    s->sock_fd = 0;
-  }
+  Connection_close(&s->connection);
   if (s->epoll_fd > 0) {
     close(s->epoll_fd);
     s->epoll_fd = 0;
   }
-}
-
-int Server_accept_inet(Server *s) {
-  int fd, flags;
-  InetAddr addr;
-  socklen_t addr_len = sizeof(addr);
-  TRY(fd = accept(s->sock_fd, (Addr *)&addr, &addr_len));
-  TRY(flags = fcntl(fd, F_GETFL, 0));
-  TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
-  TRY_CATCH(isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
-  char buf[128];
-  Str name = str_from_c0(inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)));
-  elog("Received connection from " STR_Fmt " %d\n", STR_Arg(name),
-       addr.sin_port);
-  return fd;
-}
-
-int Server_accept_unix(Server *s) {
-  int fd, flags;
-  UnixAddr addr;
-  socklen_t addr_len = sizeof(addr);
-  TRY(fd = accept(s->sock_fd, (Addr *)&addr, &addr_len));
-  TRY(flags = fcntl(fd, F_GETFL, 0));
-  TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
-  char buf[128];
-  Str name = str_from_c0(addr.sun_path);
-  elog("Received connection from " STR_Fmt "\n", STR_Arg(name));
-  return fd;
 }
 
 int Server_add_client(Server *s, int fd) {
@@ -422,9 +442,10 @@ int Server_loop(Server *s) {
     TRY(n = epoll_wait(s->epoll_fd, events, MAX_EVENTS, -1));
     for (int i = 0; i < n; ++i) {
       int fd = events[i].data.fd;
-      if (fd == s->sock_fd) {
+      if (fd == s->connection.fd) {
         int client_fd;
-        TRY_CATCH(client_fd = Server_accept_unix(s), perror("Accept error"));
+        TRY_CATCH(client_fd = Connection_accept(&s->connection),
+                  perror("Accept error"));
         TRY(Server_add_client(s, client_fd));
       } else {
         const int result = Server_handle_request(s, fd);
@@ -563,8 +584,7 @@ int info_page(Request *request) {
 int main(int argc, char **argv) {
   elog("Starting httpd...\n");
 
-  Server serv = Server_new();
-
+  Server serv;
   serv.router = (Router){
       .routes =
           (Route[]){
@@ -577,11 +597,9 @@ int main(int argc, char **argv) {
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
 
-  // TRY_CATCH(Server_create_inet(&serv, "127.0.0.1", 3210),
-  //           perror("create tcp error"));
-
-  TRY_CATCH(Server_create_unix(&serv, STR("/tmp/httpd.sock")),
-            perror("create tcp error"));
+  Connection conn = Connection_inet(STR("127.0.0.1"), 3210);
+  TRY_CATCH(Connection_connect(&conn), perror("Connect"));
+  TRY_CATCH(Server_init(&serv, conn), perror("Server init"));
 
   elog("Ready to receive requests\n");
   Server_loop(&serv);
