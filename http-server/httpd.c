@@ -30,6 +30,9 @@ typedef struct sockaddr_un UnixAddr;
 
 typedef struct epoll_event Event;
 
+ #define HTTPD_ELOG
+
+#ifdef HTTPD_ELOG
 void elog(const char *format, ...) {
   char time_buf[32];
   pthread_t th = pthread_self();
@@ -45,6 +48,9 @@ void elog(const char *format, ...) {
   vfprintf(stderr, buf, args);
   va_end(args);
 }
+#else
+#define elog(...)
+#endif
 
 int isetsockopt(int fd, int level, int option, int value) {
   return setsockopt(fd, level, option, &value, sizeof(value));
@@ -68,8 +74,7 @@ typedef struct {
   const char *data;
 } Str;
 
-#define SL(c) ((Str){.size = sizeof(c) - 1, .data = c})
-#define STR(c) str_from_parts(c, sizeof(c) - 1)
+#define STR(c) ((Str){.size = sizeof(c) - 1, .data = c})
 #define STR_NULL str_from_parts(NULL, 0)
 #define STR_Fmt "%.*s"
 #define STR_Arg(s) (int)(s).size, (s).data
@@ -236,20 +241,17 @@ int Connection_accept(Connection *conn) {
     TRY(fd = accept(conn->fd, (Addr *)&addr, &addr_len));
     TRY(flags = fcntl(fd, F_GETFL, 0));
     TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
-    Str name = str_from_c0(addr.sun_path);
-    elog("Received connection from " STR_Fmt "\n", STR_Arg(name));
+    elog("Received connection from %s", addr.sun_path);
   } else {
-    InetAddr addr;
-    socklen_t addr_len = sizeof(conn->addr.inet);
-    TRY(fd = accept(conn->fd, (Addr *)&conn->addr.inet, &addr_len));
+    InetAddr peer;
+    socklen_t addr_len = sizeof(peer);
+    TRY(fd = accept(conn->fd, (Addr *)&peer, &addr_len));
     TRY(flags = fcntl(fd, F_GETFL, 0));
     TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
     TRY_CATCH(isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
     char buf[128];
-    Str name =
-        str_from_c0(inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)));
-    elog("Received connection from " STR_Fmt " %d\n", STR_Arg(name),
-         addr.sin_port);
+    inet_ntop(AF_INET, &peer.sin_addr, buf, sizeof(buf));
+    elog("Received connection from %s:%d\n", buf, peer.sin_port);
   }
   return fd;
 }
@@ -272,11 +274,11 @@ typedef struct {
   Str message;
 } Status;
 
-const Status S200 = {s200, SL("OK")};
-const Status S304 = {s304, SL("Not Modifified")};
-const Status S404 = {s404, SL("Not Found")};
-const Str MIME_HTML = SL("text/html");
-const Str HEADER_BODY_SEPARATOR = SL("\r\n\r\n");
+const Status S200 = {s200, STR("OK")};
+const Status S304 = {s304, STR("Not Modifified")};
+const Status S404 = {s404, STR("Not Found")};
+const Str MIME_HTML = STR("text/html");
+const Str HEADER_BODY_SEPARATOR = STR("\r\n\r\n");
 
 // Header --------------------------------------------------------------------
 
@@ -444,7 +446,7 @@ Str time_delta(const struct timespec *start, const struct timespec *end,
 }
 
 int Server_handle_request(Server *s, int fd) {
-  char rbuf[16 * 1024], lbuf[1024];
+  char rbuf[16 * 1024];
   int n;
   TRY(n = recv(fd, rbuf, sizeof(rbuf), 0));
   if (n == 0) {
@@ -454,15 +456,21 @@ int Server_handle_request(Server *s, int fd) {
   Request req = Request_new(payload);
   req.fd = fd;
 
+#ifdef HTTPD_ELOG
+  char logbuf[1024];
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC, &start);
   elog(STR_Fmt " START\n", STR_Arg(req.status_line));
   RequestHandler func = Router_find(&s->router, req.path);
   int result = func(&req);
   clock_gettime(CLOCK_MONOTONIC, &end);
-  Str dt = time_delta(&start, &end, lbuf, sizeof(lbuf));
+  Str dt = time_delta(&start, &end, logbuf, sizeof(logbuf));
   elog(STR_Fmt " END " STR_Fmt "\n", STR_Arg(req.status_line), STR_Arg(dt));
   return result;
+#else
+  RequestHandler func = Router_find(&s->router, req.path);
+  return func(&req);
+#endif
 }
 
 int Server_loop(Server *s) {
@@ -501,48 +509,57 @@ int send_all(int fd, const char *payload, int n) {
   return 0;
 }
 
-int send_header(Request *req, Status status, Str content_type,
-                size_t content_size, Str etag) {
+int put_header(char *buf, Str k, Str v) {
+  if (v.size) {
+    return sprintf(buf, STR_Fmt ": " STR_Fmt NL, STR_Arg(k), STR_Arg(v));
+  }
+  return 0;
+}
 
-  char write_buf[512];
-  int n = sprintf(write_buf, STR_Fmt " %d " STR_Fmt NL, STR_Arg(req->protocol),
-                  status.status_code, STR_Arg(status.message));
-  if (content_type.size) {
-    n += sprintf(write_buf + n, "Content-Type: " STR_Fmt NL,
-                 STR_Arg(content_type));
-  }
+int send_headers(Request *req, Status status, Str content_type,
+                 size_t content_size, Str extra_headers) {
+
+  char write_buf[4096];
+  char *buf = write_buf;
+  buf += sprintf(buf, STR_Fmt " %d " STR_Fmt NL, STR_Arg(req->protocol),
+                 status.status_code, STR_Arg(status.message));
+  buf += put_header(buf, STR("Content-Type"), content_type);
   if (content_size) {
-    n += sprintf(write_buf + n, "Content-Length: %ld" NL, content_size);
+    buf += sprintf(buf, "Content-Length: %ld" NL, content_size);
   }
-  if (etag.size) {
-    n += sprintf(write_buf + n, "Etag: " STR_Fmt NL, STR_Arg(etag));
+  if (extra_headers.size) {
+    buf += sprintf(buf, STR_Fmt, STR_Arg(extra_headers));
   }
-  n += sprintf(write_buf + n, NL);
-  return send_all(req->fd, write_buf, n);
+  buf += sprintf(buf, NL);
+  return send_all(req->fd, write_buf, buf - write_buf);
 }
 
 int send_static(Request *req, Status status, Str content_type, Str content) {
-  TRY(send_header(req, status, content_type, content.size, STR_NULL));
+  TRY(send_headers(req, status, content_type, content.size, STR_NULL));
   return send_all(req->fd, content.data, content.size);
 }
 
-int send_file(Request *req, const char *filename, Status status,
-              Str content_type, Str etag) {
-  int src_fd, result;
-  struct stat s;
-  char tagbuf[64];
-  TRY(stat(filename, &s));
+Str file_etag(char *buf, struct stat *s) {
+  int n = sprintf(buf, "\"%ld-%ld.%ld\"", s->st_size, s->st_mtim.tv_sec,
+                  s->st_mtim.tv_nsec);
+  return str_from_parts(buf, n);
+}
 
-  int etag_size = snprintf(tagbuf, sizeof(tagbuf), "\"%ld-%ld.%ld\"", s.st_size,
-                           s.st_mtim.tv_sec, s.st_mtim.tv_nsec);
-  Str local_etag = str_from_parts(tagbuf, etag_size);
-  printf("ETAG " STR_Fmt " == " STR_Fmt "\n", STR_Arg(etag),
-         STR_Arg(local_etag));
-  if (str_eq(etag, local_etag)) {
-    return send_header(req, S304, STR_NULL, 0, etag);
+int send_file(Request *req, const char *filename, Status status,
+              Str content_type, Str request_etag) {
+  int src_fd, result;
+  char _etag[64], _etag_header[96];
+  struct stat s;
+  TRY(stat(filename, &s));
+  Str etag = file_etag(_etag, &s);
+  int etag_header_size = put_header(_etag_header, STR("ETag"), etag);
+  Str etag_header = str_from_parts(_etag_header, etag_header_size);
+
+  if (str_eq(request_etag, etag)) {
+    return send_headers(req, S304, STR_NULL, 0, etag_header);
   }
   TRY(src_fd = open(filename, 0, O_RDONLY));
-  TRY_CATCH(send_header(req, status, content_type, s.st_size, local_etag),
+  TRY_CATCH(send_headers(req, status, content_type, s.st_size, etag_header),
             close(src_fd));
   TRY_CATCH(result = sendfile(req->fd, src_fd, NULL, s.st_size) == -1 ? -1 : 0,
             close(src_fd));
@@ -550,13 +567,17 @@ int send_file(Request *req, const char *filename, Status status,
   return result;
 }
 
+int Request_send_file(Request *req, Str filename) {
+  Header headers[100];
+  int n = Request_headers(req, headers, 100);
+  Str etag = Headers_get_header(headers, n, STR("If-None-Match"));
+  return send_file(req, filename.data, S200, MIME_HTML, etag);
+}
+
 // APP =======================================================================
 
 int about_page(Request *request) {
-  Header headers[100];
-  int n = Request_headers(request, headers, 100);
-  Str etag = Headers_get_header(headers, n, SL("If-None-Match"));
-  return send_file(request, "about.html", S200, MIME_HTML, etag);
+  return Request_send_file(request, STR("about.html"));
 }
 
 int home_page(Request *request) {
@@ -574,25 +595,6 @@ int not_found(Request *request) {
                     "<body><h1>404 Not found</h1></body>"
                     "</html>");
   return send_static(request, S404, MIME_HTML, content);
-}
-
-int debug_page(Request *request) {
-  Str content = STR("<html>"
-                    "<head><link rel=\"icon\" href=\"data:,\" /></head>"
-                    "<body><h1>Hello, world!</h1></body>"
-                    "</html>");
-  Str header = Request_header(request);
-  Str body = Request_body(request);
-  printf("HEADER='" STR_Fmt "'\nBODY='" STR_Fmt "'\n", STR_Arg(header),
-         STR_Arg(body));
-
-  Header headers[100];
-  int n = Request_headers(request, headers, 100);
-  for (int i = 0; i < n; ++i) {
-    printf("H '" STR_Fmt "' = '" STR_Fmt "'\n", STR_Arg(headers[i].name),
-           STR_Arg(headers[i].value));
-  }
-  return send_static(request, S200, MIME_HTML, content);
 }
 
 int info_page(Request *request) {
@@ -620,10 +622,9 @@ int run(Address addr) {
           (Route[]){
               {.handler = home_page, .path = STR("/")},
               {.handler = about_page, .path = STR("/about")},
-              {.handler = debug_page, .path = STR("/debug")},
               {.handler = info_page, .path = STR("/info")},
           },
-      .size = 4,
+      .size = 3,
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
 
@@ -638,19 +639,8 @@ int run(Address addr) {
   return 0;
 }
 
-void *run_thread(void *data) {
-  run(*(Address *)data);
-  return NULL;
-}
-
 int main(int argc, char **argv) {
-  // Address addr = Address_inet(STR("127.0.0.1"), 3210);
-  //  Address addr = Address_unix(STR("/tmp/httpd.sock"));
   Address addr = Address_url(STR("tcp://127.0.0.1:3210"));
 
-  pthread_t threads[3];
-  for (int i = 0; i < 1; ++i) {
-    pthread_create(&threads[i], NULL, run_thread, &addr);
-  }
   return run(addr);
 }

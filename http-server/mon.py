@@ -36,6 +36,7 @@ class MyEventHandler(FileSystemEventHandler):
             self.state = "waiting"
             return
         self.state = "running"
+        print("--- running... ---")
         self.httpd = subprocess.Popen(["./httpd"])
         self.httpd.wait()
 
