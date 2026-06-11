@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <arpa/inet.h>
 #include <bits/time.h>
@@ -14,15 +16,16 @@
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
 #define LISTEN_BACKLOG 50
 #define MAX_EVENTS 10
-#define MAX_HEADERS 20
 
 typedef struct sockaddr Addr;
 typedef struct sockaddr_in InetAddr;
+typedef struct sockaddr_un UnixAddr;
 
 typedef struct epoll_event Event;
 
@@ -110,44 +113,40 @@ Str str_substr(Str str, Str sub) {
   return str;
 }
 
-Str str_chop_left(Str str, size_t n) {
+Str str_trim_left(Str str, size_t n) {
   if (n > str.size) {
     n = str.size;
   }
-  Str result = str;
-  result.size -= n;
-  result.data += n;
-  return result;
+  return (Str){.size = str.size - n, .data = str.data + n};
 }
 
 bool str_eq(Str a, Str b) {
   return (a.size != b.size) ? false : memcmp(a.data, b.data, a.size) == 0;
 }
 
-Str str_trim_left(Str str) {
+Str str_strip_left(Str str) {
   size_t i = 0, n = str.size;
   while (i < n && str.data[i] == ' ') {
     i += 1;
   }
-
-  return str_from_parts(str.data + i, n - i);
+  return str_trim_left(str, i);
 }
 
-Str str_trim_right(Str str) {
+Str str_strip_right(Str str) {
   size_t i = 0, n = str.size;
   while (i < n && str.data[n - 1 - i] == ' ') {
     i += 1;
   }
-
   return str_from_parts(str.data, n - i);
 }
 
-Str str_trim(Str str) { return str_trim_right(str_trim_left(str)); }
+Str str_strip(Str str) { return str_strip_right(str_strip_left(str)); }
 
 // HTTP ----------------------------------------------------------------------
 
 typedef enum {
   s200 = 200,
+  s304 = 304,
   s404 = 404,
 } StatusCode;
 
@@ -157,9 +156,10 @@ typedef struct {
 } Status;
 
 const Status S200 = {s200, SL("OK")};
-const Status S404 = {s404, SL("Not found")};
+const Status S304 = {s304, SL("Not Modifified")};
+const Status S404 = {s404, SL("Not Found")};
 const Str mime_html = SL("text/html");
-const Str hb_sep = SL("\r\n\r\n");
+const Str HEADER_BODY_SEPARATOR = SL("\r\n\r\n");
 
 // Header --------------------------------------------------------------------
 
@@ -171,12 +171,13 @@ typedef struct {
 // Request -------------------------------------------------------------------
 
 typedef struct {
+  int fd;
   Str payload;
   Str status_line;
   Str method;
   Str path;
   Str protocol;
-  int fd;
+  Str body;
 } Request;
 
 // Router --------------------------------------------------------------------
@@ -212,10 +213,13 @@ typedef struct {
   Router router;
 } Server;
 
-Server Server_new() { return (Server){.sock_fd = 0, .epoll_fd = 0}; }
+Server Server_new() {
+  int epoll_fd = epoll_create1(0);
+  return (Server){.sock_fd = 0, .epoll_fd = epoll_fd};
+}
 
-int Server_create_tcp(Server *server, const char *host, int port) {
-  int fd, epoll_fd;
+int Server_create_inet(Server *server, const char *host, int port) {
+  int fd;
   struct in_addr sin_addr;
 
   TRY(fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
@@ -229,40 +233,69 @@ int Server_create_tcp(Server *server, const char *host, int port) {
 
   TRY_CATCH(bind(fd, (Addr *)&addr, sizeof(addr)), close(fd));
   TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
-  TRY_CATCH(epoll_fd = epoll_create1(0), close(fd));
 
   Event event = {.events = EPOLLIN, .data = {.fd = fd}};
-  TRY_CATCH(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event), {
-    close(epoll_fd);
-    close(fd);
-  });
+  TRY_CATCH(epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, fd, &event),
+            { close(fd); });
   server->sock_fd = fd;
-  server->epoll_fd = epoll_fd;
+  return 0;
+}
+
+int Server_create_unix(Server *server, Str path) {
+  int fd;
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  TRY(fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0));
+  addr.sun_family = AF_UNIX, strncpy(addr.sun_path, path.data, path.size);
+
+  unlink(path.data);
+  TRY_CATCH(bind(fd, (Addr *)&addr, sizeof(addr)), close(fd));
+  TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
+
+  Event event = {.events = EPOLLIN, .data = {.fd = fd}};
+  TRY_CATCH(epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, fd, &event),
+            { close(fd); });
+
+  server->sock_fd = fd;
   return 0;
 }
 
 void Server_close(Server *s) {
-  if (s->epoll_fd > 0) {
-    close(s->epoll_fd);
-    s->epoll_fd = 0;
-  }
   if (s->sock_fd > 0) {
     close(s->sock_fd);
     s->sock_fd = 0;
   }
+  if (s->epoll_fd > 0) {
+    close(s->epoll_fd);
+    s->epoll_fd = 0;
+  }
 }
 
-int Server_accept(Server *s) {
+int Server_accept_inet(Server *s) {
   int fd, flags;
   InetAddr addr;
   socklen_t addr_len = sizeof(addr);
   TRY(fd = accept(s->sock_fd, (Addr *)&addr, &addr_len));
   TRY(flags = fcntl(fd, F_GETFL, 0));
   TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+  TRY_CATCH(isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
   char buf[128];
   Str name = str_from_c0(inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)));
   elog("Received connection from " STR_Fmt " %d\n", STR_Arg(name),
        addr.sin_port);
+  return fd;
+}
+
+int Server_accept_unix(Server *s) {
+  int fd, flags;
+  UnixAddr addr;
+  socklen_t addr_len = sizeof(addr);
+  TRY(fd = accept(s->sock_fd, (Addr *)&addr, &addr_len));
+  TRY(flags = fcntl(fd, F_GETFL, 0));
+  TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+  char buf[128];
+  Str name = str_from_c0(addr.sun_path);
+  elog("Received connection from " STR_Fmt "\n", STR_Arg(name));
   return fd;
 }
 
@@ -281,15 +314,14 @@ int Server_remove_client(Server *s, int fd) {
 
 Request Request_new(const Str payload) {
   // GET /path HTTP/1.1
-  size_t sl_index;
-  str_index(payload, '\r', &sl_index);
+  size_t status_size = 0;
+  str_index(payload, '\r', &status_size);
   Request req = {.payload = payload,
-                 .status_line = str_from_parts(payload.data, sl_index)};
+                 .status_line = str_from_parts(payload.data, status_size)};
   req.method = str_subc(req.status_line, ' ');
-  Str status_line = str_chop_left(req.status_line, req.method.size + 1);
-  req.path = str_subc(status_line, ' ');
-  req.protocol = str_chop_left(status_line, req.path.size + 1);
-
+  Str rest_status_line = str_trim_left(req.status_line, req.method.size + 1);
+  req.path = str_subc(rest_status_line, ' ');
+  req.protocol = str_trim_left(rest_status_line, req.path.size + 1);
   return req;
 }
 
@@ -297,35 +329,43 @@ Str Request_header(Request *req) {
   size_t start = req->status_line.size + 2;
   Str rest =
       str_from_parts(req->payload.data + start, req->payload.size - (start));
-  size_t hb_index;
-  str_indexstr(rest, hb_sep, &hb_index);
-  return str_from_parts(rest.data, hb_index);
+  size_t hb_index = 0;
+  str_indexstr(rest, HEADER_BODY_SEPARATOR, &hb_index);
+  return str_from_parts(rest.data, hb_index + 2);
 }
 
-int Request_headers(Request *req, Header *headers, size_t max) {
+int Request_headers(Request *req, Header *headers, size_t max_size) {
   Str header = Request_header(req);
-  size_t index, sep;
-  for (int i = 0; i < max; ++i) {
+  size_t index, sep = 0;
+  for (int i = 0; i < max_size; ++i) {
     if (str_index(header, '\r', &index) == false) {
       return i;
     }
     Str line = str_from_parts(header.data, index);
     str_index(line, ':', &sep);
     Str value = str_from_parts(line.data + sep + 1, line.size - (sep + 1));
-    value = str_trim(value);
+    value = str_strip(value);
     headers[i] =
         (Header){.name = str_from_parts(line.data, sep), .value = value};
-    header = str_from_parts(header.data + line.size + 2,
-                            header.size - (line.size + 2));
+    header = str_trim_left(header, line.size + 2);
   }
   return 0;
 }
 
+Str Headers_get_header(Header *headers, int n, Str name) {
+  for (int i = 0; i < n; ++i) {
+    if (str_eq(headers[i].name, name)) {
+      return headers[i].value;
+    }
+  }
+  return STR_NULL;
+}
+
 Str Request_body(Request *req) {
-  size_t hb_index;
-  str_indexstr(req->payload, hb_sep, &hb_index);
-  size_t start = hb_index + hb_sep.size;
-  return str_from_parts(req->payload.data + start, req->payload.size - start);
+  size_t hb_index = 0;
+  str_indexstr(req->payload, HEADER_BODY_SEPARATOR, &hb_index);
+  size_t start = hb_index + HEADER_BODY_SEPARATOR.size;
+  return str_trim_left(req->payload, start);
 }
 
 Str time_delta(const struct timespec *start, const struct timespec *end,
@@ -354,7 +394,7 @@ Str time_delta(const struct timespec *start, const struct timespec *end,
 }
 
 int Server_handle_request(Server *s, int fd) {
-  char rbuf[16 * 1024], lbuf[32];
+  char rbuf[16 * 1024], lbuf[1024];
   int n;
   TRY(n = recv(fd, rbuf, sizeof(rbuf), 0));
   if (n == 0) {
@@ -366,13 +406,12 @@ int Server_handle_request(Server *s, int fd) {
 
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC, &start);
-  elog("[START] " STR_Fmt "\n", STR_Arg(req.status_line));
+  elog(STR_Fmt " START\n", STR_Arg(req.status_line));
   RequestHandler func = Router_find(&s->router, req.path);
   int result = func(&req);
   clock_gettime(CLOCK_MONOTONIC, &end);
   Str dt = time_delta(&start, &end, lbuf, sizeof(lbuf));
-  elog("[ END ] " STR_Fmt " " STR_Fmt "\n", STR_Arg(req.status_line),
-       STR_Arg(dt));
+  elog(STR_Fmt " END " STR_Fmt "\n", STR_Arg(req.status_line), STR_Arg(dt));
   return result;
 }
 
@@ -385,7 +424,7 @@ int Server_loop(Server *s) {
       int fd = events[i].data.fd;
       if (fd == s->sock_fd) {
         int client_fd;
-        TRY(client_fd = Server_accept(s));
+        TRY_CATCH(client_fd = Server_accept_unix(s), perror("Accept error"));
         TRY(Server_add_client(s, client_fd));
       } else {
         const int result = Server_handle_request(s, fd);
@@ -411,44 +450,71 @@ int send_all(int fd, const char *payload, int n) {
   return 0;
 }
 
-int send_header(int fd, Status status, Str content_type, size_t content_size) {
+int send_header(Request *req, Status status, Str content_type,
+                size_t content_size, Str etag) {
 
-  char write_buf[256];
-  int n = sprintf(write_buf,
-                  "HTTP/1.1 %d " STR_Fmt NL "Content-Type: " STR_Fmt NL
-                  "Content-Length: %ld" NL NL,
-                  status.status_code, STR_Arg(status.message),
-                  STR_Arg(content_type), content_size);
-  return send_all(fd, write_buf, n);
+  char write_buf[512];
+  int n = sprintf(write_buf, STR_Fmt " %d " STR_Fmt NL, STR_Arg(req->protocol),
+                  status.status_code, STR_Arg(status.message));
+  if (content_type.size) {
+    n += sprintf(write_buf + n, "Content-Type: " STR_Fmt NL,
+                 STR_Arg(content_type));
+  }
+  if (content_size) {
+    n += sprintf(write_buf + n, "Content-Length: %ld" NL, content_size);
+  }
+  if (etag.size) {
+    n += sprintf(write_buf + n, "Etag: " STR_Fmt NL, STR_Arg(etag));
+  }
+  n += sprintf(write_buf + n, NL);
+  return send_all(req->fd, write_buf, n);
 }
 
-int send_static(int fd, Status status, Str content_type, Str content) {
-  TRY(send_header(fd, status, content_type, content.size));
-  return send_all(fd, content.data, content.size);
+int send_static(Request *req, Status status, Str content_type, Str content) {
+  TRY(send_header(req, status, content_type, content.size, STR_NULL));
+  return send_all(req->fd, content.data, content.size);
 }
 
-int send_file(int dst, const char *filename, Status status, Str content_type) {
+int send_file(Request *req, const char *filename, Status status,
+              Str content_type, Str etag) {
   int src_fd, result;
   struct stat s;
+  char tagbuf[64];
+  TRY(stat(filename, &s));
+
+  int etag_size = snprintf(tagbuf, sizeof(tagbuf), "\"%ld-%ld.%ld\"", s.st_size,
+                           s.st_mtim.tv_sec, s.st_mtim.tv_nsec);
+  Str local_etag = str_from_parts(tagbuf, etag_size);
+  printf("ETAG " STR_Fmt " == " STR_Fmt "\n", STR_Arg(etag),
+         STR_Arg(local_etag));
+  if (str_eq(etag, local_etag)) {
+    return send_header(req, S304, STR_NULL, 0, etag);
+  }
   TRY(src_fd = open(filename, 0, O_RDONLY));
-  TRY_CATCH(fstat(src_fd, &s), close(src_fd))
-  TRY_CATCH(send_header(dst, status, content_type, s.st_size), close(src_fd));
-  TRY_CATCH(result = sendfile(dst, src_fd, NULL, s.st_size) == -1 ? -1 : 0,
+  TRY_CATCH(send_header(req, status, content_type, s.st_size, local_etag),
+            close(src_fd));
+  TRY_CATCH(result = sendfile(req->fd, src_fd, NULL, s.st_size) == -1 ? -1 : 0,
             close(src_fd));
   close(src_fd);
   return result;
 }
 
+// APP =======================================================================
+
 int about_page(Request *request) {
-  return send_file(request->fd, "about.html", S200, mime_html);
+  Header headers[100];
+  Request_headers(request, headers, sizeof(headers));
+  Str etag = Headers_get_header(headers, sizeof(headers), SL("If-None-Match"));
+  return send_file(request, "about.html", S200, mime_html, etag);
 }
 
 int home_page(Request *request) {
-  Str content = STR("<html>"
+  Str content = STR("<!DOCTYPE html>"
+                    "<html>"
                     "<head><link rel=\"icon\" href=\"data:,\" /></head>"
                     "<body><h1>Hello, world!</h1></body>"
                     "</html>");
-  return send_static(request->fd, S200, mime_html, content);
+  return send_static(request, S200, mime_html, content);
 }
 
 int not_found(Request *request) {
@@ -456,7 +522,7 @@ int not_found(Request *request) {
                     "<head><link rel=\"icon\" href=\"data:,\" /></head>"
                     "<body><h1>404 Not found</h1></body>"
                     "</html>");
-  return send_static(request->fd, S404, mime_html, content);
+  return send_static(request, S404, mime_html, content);
 }
 
 int debug_page(Request *request) {
@@ -470,15 +536,28 @@ int debug_page(Request *request) {
          STR_Arg(body));
 
   Header headers[100];
-  int n = Request_headers(request, headers, 100);
+  int n = Request_headers(request, headers, sizeof(headers));
   for (int i = 0; i < n; ++i) {
     printf("H '" STR_Fmt "' = '" STR_Fmt "'\n", STR_Arg(headers[i].name),
            STR_Arg(headers[i].value));
   }
-  return send_static(request->fd, S200, mime_html, content);
+  return send_static(request, S200, mime_html, content);
 }
+
 int info_page(Request *request) {
-  return send_static(request->fd, S200, mime_html, request->payload);
+  const int N = 8 * 1024;
+  char buf[N];
+
+  Header headers[100];
+  int n = Request_headers(request, headers, sizeof(headers));
+  int size =
+      snprintf(buf, N, "<p>" STR_Fmt "</p>", STR_Arg(request->status_line));
+  for (int i = 0; i < n; ++i) {
+    size += snprintf(buf + size, N - size, STR_Fmt ": " STR_Fmt "<br/>",
+                     STR_Arg(headers[i].name), STR_Arg(headers[i].value));
+  }
+  Str response = str_from_parts(buf, size);
+  return send_static(request, S200, mime_html, response);
 }
 
 int main(int argc, char **argv) {
@@ -498,7 +577,10 @@ int main(int argc, char **argv) {
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
 
-  TRY_CATCH(Server_create_tcp(&serv, "127.0.0.1", 3210),
+  // TRY_CATCH(Server_create_inet(&serv, "127.0.0.1", 3210),
+  //           perror("create tcp error"));
+
+  TRY_CATCH(Server_create_unix(&serv, STR("/tmp/httpd.sock")),
             perror("create tcp error"));
 
   elog("Ready to receive requests\n");
