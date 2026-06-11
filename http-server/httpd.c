@@ -30,7 +30,7 @@ typedef struct sockaddr_un UnixAddr;
 
 typedef struct epoll_event Event;
 
- #define HTTPD_ELOG
+#define HTTPD_ELOG
 
 #ifdef HTTPD_ELOG
 void elog(const char *format, ...) {
@@ -159,6 +159,15 @@ bool str_starts_with(Str str, Str prefix) {
   return false;
 }
 
+bool str_ends_with(Str str, Str suffix) {
+  if (suffix.size <= str.size) {
+    Str actual_suffix =
+        str_from_parts(str.data + str.size - suffix.size, suffix.size);
+    return str_eq(actual_suffix, suffix);
+  }
+  return false;
+}
+
 // Address -------------------------------------------------------------------
 
 typedef struct {
@@ -277,6 +286,7 @@ typedef struct {
 const Status S200 = {s200, STR("OK")};
 const Status S304 = {s304, STR("Not Modifified")};
 const Status S404 = {s404, STR("Not Found")};
+const Str MIME_PLAIN = STR("text/plain");
 const Str MIME_HTML = STR("text/html");
 const Str HEADER_BODY_SEPARATOR = STR("\r\n\r\n");
 
@@ -571,7 +581,13 @@ int Request_send_file(Request *req, Str filename) {
   Header headers[100];
   int n = Request_headers(req, headers, 100);
   Str etag = Headers_get_header(headers, n, STR("If-None-Match"));
-  return send_file(req, filename.data, S200, MIME_HTML, etag);
+
+  Str mime = MIME_PLAIN;
+  if (str_ends_with(filename, STR(".html"))) {
+    mime = MIME_HTML;
+  }
+
+  return send_file(req, filename.data, S200, mime, etag);
 }
 
 // APP =======================================================================
