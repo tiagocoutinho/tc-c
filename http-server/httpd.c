@@ -142,6 +142,14 @@ Str str_strip_right(Str str) {
 
 Str str_strip(Str str) { return str_strip_right(str_strip_left(str)); }
 
+bool str_starts_with(Str str, Str prefix) {
+  if (prefix.size <= str.size) {
+    Str actual_prefix = str_from_parts(str.data, prefix.size);
+    return str_eq(actual_prefix, prefix);
+  }
+  return false;
+}
+
 // Address -------------------------------------------------------------------
 
 typedef struct {
@@ -168,6 +176,21 @@ Address Address_unix(Str path) {
   addr.unix.sun_family = AF_UNIX;
   strncpy(addr.unix.sun_path, path.data, path.size);
   return addr;
+}
+
+Address Address_url(Str url) {
+  const Str unix = STR("unix://");
+  const Str tcp = STR("tcp://");
+  if (str_starts_with(url, unix)) {
+    Str path = str_trim_left(url, unix.size);
+    return Address_unix(path);
+  }
+  url = str_trim_left(url, tcp.size);
+  size_t index;
+  str_index(url, ':', &index);
+  const Str host = str_from_parts(url.data, index);
+  const int port = atoi(url.data + index + 1);
+  return Address_inet(host, port);
 }
 
 // Connection ----------------------------------------------------------------
@@ -248,7 +271,7 @@ typedef struct {
 const Status S200 = {s200, SL("OK")};
 const Status S304 = {s304, SL("Not Modifified")};
 const Status S404 = {s404, SL("Not Found")};
-const Str mime_html = SL("text/html");
+const Str MIME_HTML = SL("text/html");
 const Str HEADER_BODY_SEPARATOR = SL("\r\n\r\n");
 
 // Header --------------------------------------------------------------------
@@ -529,7 +552,7 @@ int about_page(Request *request) {
   Header headers[100];
   Request_headers(request, headers, sizeof(headers));
   Str etag = Headers_get_header(headers, sizeof(headers), SL("If-None-Match"));
-  return send_file(request, "about.html", S200, mime_html, etag);
+  return send_file(request, "about.html", S200, MIME_HTML, etag);
 }
 
 int home_page(Request *request) {
@@ -538,7 +561,7 @@ int home_page(Request *request) {
                     "<head><link rel=\"icon\" href=\"data:,\" /></head>"
                     "<body><h1>Hello, world!</h1></body>"
                     "</html>");
-  return send_static(request, S200, mime_html, content);
+  return send_static(request, S200, MIME_HTML, content);
 }
 
 int not_found(Request *request) {
@@ -546,7 +569,7 @@ int not_found(Request *request) {
                     "<head><link rel=\"icon\" href=\"data:,\" /></head>"
                     "<body><h1>404 Not found</h1></body>"
                     "</html>");
-  return send_static(request, S404, mime_html, content);
+  return send_static(request, S404, MIME_HTML, content);
 }
 
 int debug_page(Request *request) {
@@ -565,7 +588,7 @@ int debug_page(Request *request) {
     printf("H '" STR_Fmt "' = '" STR_Fmt "'\n", STR_Arg(headers[i].name),
            STR_Arg(headers[i].value));
   }
-  return send_static(request, S200, mime_html, content);
+  return send_static(request, S200, MIME_HTML, content);
 }
 
 int info_page(Request *request) {
@@ -581,7 +604,7 @@ int info_page(Request *request) {
                      STR_Arg(headers[i].name), STR_Arg(headers[i].value));
   }
   Str response = str_from_parts(buf, size);
-  return send_static(request, S200, mime_html, response);
+  return send_static(request, S200, MIME_HTML, response);
 }
 
 int main(int argc, char **argv) {
@@ -601,8 +624,9 @@ int main(int argc, char **argv) {
   };
 
   Connection conn;
-  //Address addr = Address_inet(STR("127.0.0.1"), 3210);
-  Address addr = Address_unix(STR("/tmp/httpd.sock"));
+  // Address addr = Address_inet(STR("127.0.0.1"), 3210);
+  //  Address addr = Address_unix(STR("/tmp/httpd.sock"));
+  Address addr = Address_url(STR("tcp://127.0.0.1:3210"));
   TRY_CATCH(Connection_connect(&conn, addr), perror("Connect"));
   TRY_CATCH(Server_init(&serv, conn), perror("Server init"));
 
