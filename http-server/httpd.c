@@ -142,41 +142,68 @@ Str str_strip_right(Str str) {
 
 Str str_strip(Str str) { return str_strip_right(str_strip_left(str)); }
 
-// Connection ----------------------------------------------------------------
+// Address -------------------------------------------------------------------
 
 typedef struct {
   int domain;
   union {
     InetAddr inet;
     UnixAddr unix;
-  } addr;
-  int fd;
+  };
+} Address;
 
+Address Address_inet(Str host, int port) {
+  Address addr = {.domain = AF_INET};
+  if (inet_pton(AF_INET, host.data, &addr.inet.sin_addr) == -1) {
+    return addr;
+  };
+  addr.inet.sin_family = AF_INET;
+  addr.inet.sin_port = htons(port);
+  return addr;
+}
+
+Address Address_unix(Str path) {
+  Address addr = {.domain = AF_UNIX};
+  memset(&addr.unix, 0, sizeof(addr.unix));
+  addr.unix.sun_family = AF_UNIX;
+  strncpy(addr.unix.sun_path, path.data, path.size);
+  return addr;
+}
+
+// Connection ----------------------------------------------------------------
+
+typedef struct {
+  Address addr;
+  int fd;
 } Connection;
 
-int Connection_connect(Connection *conn) {
+int Connection_connect(Connection *conn, Address addr) {
+  conn->addr = addr;
+  conn->fd = -1;
   int fd;
-  TRY(fd = socket(conn->domain, SOCK_STREAM | SOCK_NONBLOCK, 0));
-  conn->fd = fd;
-  if (conn->domain == AF_UNIX) {
-    unlink(conn->addr.unix.sun_path);
-    TRY_CATCH(bind(fd, (Addr *)&conn->addr.unix, sizeof(conn->addr.unix)),
-              close(fd));
-    TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
+  TRY(fd = socket(addr.domain, SOCK_STREAM | SOCK_NONBLOCK, 0));
+  socklen_t socklen;
+  Addr *address;
+  if (addr.domain == AF_UNIX) {
+    unlink(addr.unix.sun_path);
+    socklen = sizeof(addr.unix);
+    address = (Addr *)&addr.unix;
   } else {
     TRY_CATCH(isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1), close(fd));
     TRY_CATCH(isetsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1), close(fd));
     TRY_CATCH(isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
-    TRY_CATCH(bind(fd, (Addr *)&conn->addr.inet, sizeof(conn->addr.inet)),
-              close(fd));
-    TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
+    socklen = sizeof(addr.inet);
+    address = (Addr *)&addr.inet;
   }
+  TRY_CATCH(bind(fd, address, socklen), close(fd));
+  TRY_CATCH(listen(fd, LISTEN_BACKLOG), close(fd));
+  conn->fd = fd;
   return 0;
 }
 
 int Connection_accept(Connection *conn) {
   int fd, flags;
-  if (conn->domain == AF_UNIX) {
+  if (conn->addr.domain == AF_UNIX) {
     UnixAddr addr;
     socklen_t addr_len = sizeof(addr);
     TRY(fd = accept(conn->fd, (Addr *)&addr, &addr_len));
@@ -198,30 +225,6 @@ int Connection_accept(Connection *conn) {
          addr.sin_port);
   }
   return fd;
-}
-
-Connection Connection_inet(Str host, int port) {
-  Connection conn = {
-      .domain = AF_INET,
-      .fd = -1,
-  };
-  struct in_addr sin_addr;
-  if (inet_pton(AF_INET, host.data, &sin_addr) == -1) {
-    return conn;
-  };
-
-  InetAddr addr = {
-      .sin_family = AF_INET, .sin_port = htons(port), .sin_addr = sin_addr};
-  conn.addr.inet = addr;
-  return conn;
-}
-
-Connection Connection_unix(Str path) {
-  Connection conn = {.domain = AF_UNIX, .fd = -1};
-  memset(&conn.addr.unix, 0, sizeof(conn.addr.unix));
-  conn.addr.unix.sun_family = AF_UNIX;
-  strncpy(conn.addr.unix.sun_path, path.data, path.size);
-  return conn;
 }
 
 void Connection_close(Connection *conn) {
@@ -597,8 +600,10 @@ int main(int argc, char **argv) {
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
 
-  Connection conn = Connection_inet(STR("127.0.0.1"), 3210);
-  TRY_CATCH(Connection_connect(&conn), perror("Connect"));
+  Connection conn;
+  //Address addr = Address_inet(STR("127.0.0.1"), 3210);
+  Address addr = Address_unix(STR("/tmp/httpd.sock"));
+  TRY_CATCH(Connection_connect(&conn, addr), perror("Connect"));
   TRY_CATCH(Server_init(&serv, conn), perror("Server init"));
 
   elog("Ready to receive requests\n");
