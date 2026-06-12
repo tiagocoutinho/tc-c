@@ -32,7 +32,7 @@ class MyEventHandler(FileSystemEventHandler):
         clear_screen = '\033[2J\033[H'
         print(clear_screen);
         print("--- compiling... ---")
-        if subprocess.call(["gcc", "-Wall", "-ansi", "-ggdb", "-std=c11", "-o", "httpd", "httpd.c"]):
+        if subprocess.call(["clang", "-Wall", "-ansi", "-std=c23", "-O2", "-o", "httpd", "httpd.c"]):
             self.state = "waiting"
             return
         self.state = "running"
