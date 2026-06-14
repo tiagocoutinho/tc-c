@@ -79,7 +79,7 @@ typedef struct {
 } HttpdStr;
 
 #define STR(c) ((HttpdStr){.size = sizeof(c) - 1, .data = c})
-#define STR_NULL httpd_str_from_parts(nullptr, 0)
+#define STR_NULL httpd_str_from_parts(NULL, 0)
 #define STR_Fmt "%.*s"
 #define STR_Arg(s) (int)(s).size, (s).data
 #define CRLF "\r\n"
@@ -624,4 +624,3 @@ int httpd_request_send_file(HttpdRequest *req, HttpdStr filename) {
 #define TRY _HTTPD_TRY_CATH
 #undef _HTTPD_TRY_CATCH
 #endif
-
