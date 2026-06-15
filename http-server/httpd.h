@@ -389,81 +389,100 @@ const HttpdStr MIME_PLAIN = STR("text/plain");
 const HttpdStr MIME_HTML = STR("text/html");
 const HttpdStr HEADER_BODY_SEPARATOR = STR("\r\n\r\n");
 
-// HttpdHeader
-// --------------------------------------------------------------------
-
-typedef struct {
-  HttpdStr name;
-  HttpdStr value;
-} HttpdHeader;
-
-// HttpdQuery
-
 typedef struct {
   HttpdStr key;
   HttpdStr value;
-} HttpdQueryParam;
+} HttpdKeyValue;
 
 typedef struct {
-  HttpdStr query;
-} HttpdQueryIterator;
+  HttpdStr data;
+} HttpdIterator;
 
-HttpdQueryIterator httpd_query_iterator(HttpdStr query) {
-  return (HttpdQueryIterator){.query = query};
+// HttpdQuery ----------------------------------------------------------------
+
+typedef HttpdKeyValue HttpdQueryParam;
+typedef HttpdIterator HttpdQueryIterator;
+
+HttpdQueryIterator httpd_query_iterator(HttpdStr data) {
+  return (HttpdQueryIterator){.data = data};
 }
 
 HttpdQueryParam httpd_query_iterator_next(HttpdQueryIterator *q) {
-  if (!q->query.size) {
+  if (!q->data.size) {
     return (HttpdQueryParam){};
   }
   size_t field_sep = 0;
-  httpd_str_index(q->query, '=', &field_sep);
-  HttpdQueryParam r = {
-      .key = httpd_str_from_parts(q->query.data, field_sep),
+  httpd_str_index(q->data, '=', &field_sep);
+  HttpdKeyValue r = {
+      .key = httpd_str_from_parts(q->data.data, field_sep),
   };
   size_t field_end = 0;
-  if (!httpd_str_index(q->query, '&', &field_end)) {
-    field_end = q->query.size;
+  if (!httpd_str_index(q->data, '&', &field_end)) {
+    field_end = q->data.size;
   }
-  r.value = httpd_str_from_parts(q->query.data + field_sep + 1,
+  r.value = httpd_str_from_parts(q->data.data + field_sep + 1,
                                  field_end - field_sep - 1);
-  httpd_str_self_trim_left(&q->query, field_end + 1);
+  httpd_str_self_trim_left(&q->data, field_end + 1);
   return r;
 };
 
 // HttpdHeaderIterator -------------------------------------------------------
 
-typedef struct {
-  HttpdStr header;
+typedef HttpdKeyValue HttpdHeader;
+typedef HttpdIterator HttpdHeaderIterator;
 
-} HttpdHeaderIterator;
-
-HttpdHeaderIterator httpd_header_iterator(HttpdStr header) {
-    printf("HEADERS = '" STR_Fmt "'\n", STR_Arg(header));
-  return (HttpdHeaderIterator){.header = header};
+HttpdHeaderIterator httpd_header_iterator(HttpdStr data) {
+  return (HttpdHeaderIterator){.data = data};
 }
 
 HttpdHeader httpd_header_iterator_next(HttpdHeaderIterator *it) {
-    if (!it->header.size) {
+    if (!it->data.size) {
         return (HttpdHeader){};
     }
     size_t field_sep = 0;
-    httpd_str_index(it->header, ':', &field_sep);
+    httpd_str_index(it->data, ':', &field_sep);
     HttpdHeader r = {
-        .name = httpd_str_from_parts(it->header.data, field_sep),
+        .key = httpd_str_from_parts(it->data.data, field_sep),
     };
     size_t field_end = 0;
-    if (!httpd_str_indexstr(it->header, STR(CRLF), &field_end)) {
-      field_end = it->header.size;
+    if (!httpd_str_indexstr(it->data, STR(CRLF), &field_end)) {
+      field_end = it->data.size;
     }
-    r.value = httpd_str_from_parts(it->header.data + field_sep + 1,
+    r.value = httpd_str_from_parts(it->data.data + field_sep + 1,
             field_end - field_sep - 1);
-    printf("HEADER '" STR_Fmt "' = '" STR_Fmt "'\n", STR_Arg(r.name),STR_Arg(r.value));
     r.value = httpd_str_strip(r.value);
 
-    httpd_str_self_trim_left(&it->header, field_end + 2);
+    httpd_str_self_trim_left(&it->data, field_end + 2);
     return r;
 }
+
+// HttpdFormIterator ---------------------------------------------------------
+
+typedef HttpdKeyValue HttpdFormParam;
+typedef HttpdIterator HttpdFormIterator;
+
+HttpdFormIterator httpd_form_iterator(HttpdStr data) {
+  return (HttpdQueryIterator){.data = data};
+}
+
+HttpdFormParam httpd_form_iterator_next(HttpdQueryIterator *q) {
+  if (!q->data.size) {
+    return (HttpdFormParam){};
+  }
+  size_t field_sep = 0;
+  httpd_str_index(q->data, '=', &field_sep);
+  HttpdKeyValue r = {
+      .key = httpd_str_from_parts(q->data.data, field_sep),
+  };
+  size_t field_end = 0;
+  if (!httpd_str_index(q->data, '&', &field_end)) {
+    field_end = q->data.size;
+  }
+  r.value = httpd_str_from_parts(q->data.data + field_sep + 1,
+                                 field_end - field_sep - 1);
+  httpd_str_self_trim_left(&q->data, field_end + 1);
+  return r;
+};
 
 // HttpdRequest
 // -------------------------------------------------------------------
@@ -510,7 +529,8 @@ HttpdRequest httpd_request_new(HttpdStr data) {
   size_t hb_index = 0;
   httpd_str_indexstr(data, HEADER_BODY_SEPARATOR, &hb_index);
   req.header = httpd_str_from_parts(data.data, hb_index + 2);
-  req.body = httpd_str_trim_left(data, hb_index + 2);
+//  req.body = httpd_str_from_parts(data.data + hb_index + sizeof(CRLF CRLF), 
+  req.body = httpd_str_trim_left(data, hb_index + 4);
   return req;
 }
 
@@ -522,11 +542,15 @@ HttpdHeaderIterator httpd_request_header_iterator(HttpdRequest *req) {
   return httpd_header_iterator(req->header);
 }
 
+HttpdFormIterator httpd_request_form_iterator(HttpdRequest *req) {
+    return httpd_form_iterator(req->body);
+}
+
 HttpdStr httpd_request_get_header(HttpdRequest *req, HttpdStr name) {
   HttpdHeaderIterator it = httpd_request_header_iterator(req);
-  while (it.header.size) {
+  while (it.data.size) {
     HttpdHeader header = httpd_header_iterator_next(&it);
-    if (httpd_str_eq(header.name, name)) {
+    if (httpd_str_eq(header.key, name)) {
         return header.value;
     }
   }
@@ -553,7 +577,7 @@ typedef struct {
 HttpdRequestHandler HttpdRouter_find(HttpdRouter *router, HttpdRequest *req) {
   for (size_t i = 0; i < router->size; ++i) {
     const HttpdRoute *route = &router->routes[i];
-    if (!route->method || (req->method && route->method)) {
+    if (!route->method || (req->method & route->method)) {
       if (httpd_str_eq(req->path, router->routes[i].path)) {
         return router->routes[i].handler;
       }

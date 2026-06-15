@@ -3,6 +3,15 @@
 
 #include "httpd.h"
 
+typedef struct {
+  char first_name[32];
+  char last_name[32];
+  char email[64];
+} User;
+
+User user = {
+    .first_name = "John", .last_name = "Doe", .email = "john.doe@example.com"};
+
 int home_page(HttpdRequest *request) {
   HttpdStr content =
       STR("<!DOCTYPE html>"
@@ -19,37 +28,64 @@ int home_page(HttpdRequest *request) {
   return httpd_request_send_static(request, S200, MIME_HTML, content);
 }
 
-int contact(HttpdRequest *request) {
-  HttpdStr content =
-      STR("<!DOCTYPE html>"
-          "<div hx-target:inherited=\"this\" hx-swap:inherited=\"outerHTML\">"
-          "<div><label>First Name</label>: Joe</div>"
-          "<div><label>Last Name</label>: Blow</div>"
-          "<div><label>Email</label>: joe@blow.com</div>"
-          "<button hx-get=\"/edit\">Click To Edit</button>"
-          "</div>");
+int view_contact(HttpdRequest *request) {
+  char buf[1024];
+  int n = snprintf(
+      buf, 1024,
+      "<!DOCTYPE html>"
+      "<div hx-target:inherited=\"this\" hx-swap:inherited=\"outerHTML\">"
+      "<div><label>First Name</label>: %s</div>"
+      "<div><label>Last Name</label>: %s</div>"
+      "<div><label>Email</label>: %s</div>"
+      "<button hx-get=\"/edit\">Click To Edit</button>"
+      "</div>",
+      user.first_name, user.last_name, user.email);
+  HttpdStr content = httpd_str_from_parts(buf, n);
   return httpd_request_send_static(request, S200, MIME_HTML, content);
 }
 
+int update_contact(HttpdRequest *request) {
+
+  HttpdFormIterator it = httpd_request_form_iterator(request);
+
+  while (it.data.size) {
+    HttpdFormParam param = httpd_form_iterator_next(&it);
+    if (httpd_str_eq(param.key, STR("firstName"))) {
+      memset(user.first_name, 0, sizeof(user.first_name));
+      memcpy(user.first_name, param.value.data, param.value.size);
+    } else if (httpd_str_eq(param.key, STR("lastName"))) {
+      memset(user.last_name, 0, sizeof(user.first_name));
+      memcpy(user.last_name, param.value.data, param.value.size);
+    } else if (httpd_str_eq(param.key, STR("email"))) {
+      memset(user.email, 0, sizeof(user.first_name));
+      memcpy(user.email, param.value.data, param.value.size);
+    }
+  }
+  return view_contact(request);
+}
+
 int edit_form(HttpdRequest *request) {
-  HttpdStr content =
-      STR("<form hx-put=\"/contact\" hx-target:inherited=\"this\" "
-          "hx-swap:inherited=\"outerHTML\">"
-          "<div>"
-          "<label>First Name</label>"
-          "<input type=\"text\" name=\"firstName\" value=\"Joe\">"
-          "</div>"
-          "<div>"
-          "<label>Last Name</label>"
-          "<input type=\"text\" name=\"lastName\" value=\"Blow\">"
-          "</div>"
-          "<div>"
-          "<label>Email Address</label>"
-          "<input type=\"email\" name=\"email\" value=\"joe@blow.com\">"
-          "</div>"
-          "<button type=\"submit\">Submit</button>"
-          "<button hx-get=\"/contact\">Cancel</button>"
-          "</form>");
+  char buf[1024];
+  int n = snprintf(buf, 1024,
+                   "<form hx-put=\"/contact\" hx-target:inherited=\"this\" "
+                   "hx-swap:inherited=\"outerHTML\">"
+                   "<div>"
+                   "<label>First Name</label>"
+                   "<input type=\"text\" name=\"firstName\" value=\"%s\">"
+                   "</div>"
+                   "<div>"
+                   "<label>Last Name</label>"
+                   "<input type=\"text\" name=\"lastName\" value=\"%s\">"
+                   "</div>"
+                   "<div>"
+                   "<label>Email Address</label>"
+                   "<input type=\"email\" name=\"email\" value=\"%s\">"
+                   "</div>"
+                   "<button type=\"submit\">Submit</button>"
+                   "<button hx-get=\"/contact\">Cancel</button>"
+                   "</form>",
+                   user.first_name, user.last_name, user.email);
+  HttpdStr content = httpd_str_from_parts(buf, n);
   return httpd_request_send_static(request, S200, MIME_HTML, content);
 }
 
@@ -69,14 +105,17 @@ int run(HttpdAddress addr) {
       .routes =
           (HttpdRoute[]){
               {.handler = home_page, .method = METHOD_GET, .path = STR("/")},
-              {.handler = contact,
+              {.handler = view_contact,
                .method = METHOD_GET,
+               .path = STR("/contact")},
+              {.handler = update_contact,
+               .method = METHOD_PUT,
                .path = STR("/contact")},
               {.handler = edit_form,
                .method = METHOD_GET,
                .path = STR("/edit")},
           },
-      .size = 3,
+      .size = 4,
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
 

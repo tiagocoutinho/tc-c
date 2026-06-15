@@ -42,7 +42,7 @@ int info_page(HttpdRequest *request) {
 
   HttpdQueryIterator qit = httpd_request_query_iterator(request);
 
-  while (qit.query.size) {
+  while (qit.data.size) {
     HttpdQueryParam param = httpd_query_iterator_next(&qit);
     httpd_strio_printf(&out, "    " STR_Fmt " = " STR_Fmt "\n",
                        STR_Arg(param.key), STR_Arg(param.value));
@@ -50,9 +50,9 @@ int info_page(HttpdRequest *request) {
   httpd_strio_printf(&out, "</code></pre><h3>Headers</h3><pre><code>");
 
   HttpdHeaderIterator hit = httpd_request_header_iterator(request);
-  while (hit.header.size) {
+  while (hit.data.size) {
     HttpdHeader header = httpd_header_iterator_next(&hit);
-    httpd_strio_printf(&out, STR_Fmt ": " STR_Fmt "\n", STR_Arg(header.name),
+    httpd_strio_printf(&out, STR_Fmt ": " STR_Fmt "\n", STR_Arg(header.key),
                        STR_Arg(header.value));
   }
 
