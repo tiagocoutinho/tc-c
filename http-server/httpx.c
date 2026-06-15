@@ -12,7 +12,8 @@ int home_page(HttpdRequest *request) {
           "src=\"https://cdn.jsdelivr.net/npm/htmx.org@4.0.0-beta4\"></script>"
           "</head>"
           "<body>"
-          "<div hx-get=\"/contact\" hx-swap=\"outerHTML\" hx-trigger=\"load\"></div>"
+          "<div hx-get=\"/contact\" hx-swap=\"outerHTML\" "
+          "hx-trigger=\"load\"></div>"
           "</body>"
           "</html>");
   return httpd_request_send_static(request, S200, MIME_HTML, content);
@@ -67,9 +68,13 @@ int run(HttpdAddress addr) {
   serv.router = (HttpdRouter){
       .routes =
           (HttpdRoute[]){
-              {.handler = home_page, .path = STR("/")},
-              {.handler = contact, .path = STR("/contact")},
-              {.handler = edit_form, .path = STR("/edit")},
+              {.handler = home_page, .method = METHOD_GET, .path = STR("/")},
+              {.handler = contact,
+               .method = METHOD_GET,
+               .path = STR("/contact")},
+              {.handler = edit_form,
+               .method = METHOD_GET,
+               .path = STR("/edit")},
           },
       .size = 3,
       .NotFound = {.handler = not_found, .path = STR_NULL},

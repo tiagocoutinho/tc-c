@@ -1,4 +1,4 @@
-//#define HTTPD_ELOG
+// #define HTTPD_ELOG
 #define HTTPD_IMPLEMENTATION
 
 #include "httpd.h"
@@ -47,9 +47,13 @@ int run(HttpdAddress addr) {
   serv.router = (HttpdRouter){
       .routes =
           (HttpdRoute[]){
-              {.handler = home_page, .path = STR("/")},
-              {.handler = about_page, .path = STR("/about")},
-              {.handler = info_page, .path = STR("/info")},
+              {.handler = home_page, .method = METHOD_GET, .path = STR("/")},
+              {.handler = about_page,
+               .method = METHOD_ANY,
+               .path = STR("/about")},
+              {.handler = info_page,
+               .method = METHOD_GET,
+               .path = STR("/info")},
           },
       .size = 3,
       .NotFound = {.handler = not_found, .path = STR_NULL},

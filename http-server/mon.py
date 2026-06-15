@@ -15,7 +15,8 @@ class MyEventHandler(FileSystemEventHandler):
             return
         if not event.event_type == "modified":
             return
-        if not event.src_path.endswith(".c"):
+        path = event.src_path
+        if not path.endswith(".c") and not path.endswith(".h"):
             return
         if self.state == "waiting":
             self.start_make_and_run()

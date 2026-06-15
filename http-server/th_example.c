@@ -27,7 +27,7 @@ int run(HttpdAddress addr) {
   serv.router = (HttpdRouter){
       .routes =
           (HttpdRoute[]){
-              {.handler = home_page, .path = STR("/")},
+              {.handler = home_page, .method = METHOD_GET, .path = STR("/")},
           },
       .size = 1,
       .NotFound = {.handler = not_found, .path = STR_NULL},

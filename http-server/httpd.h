@@ -216,7 +216,7 @@ typedef struct {
   int domain;
   union {
     struct sockaddr_in inet;
-    struct sockaddr_un unix;
+    struct sockaddr_un unx;
   };
 } HttpdAddress;
 
@@ -230,20 +230,20 @@ HttpdAddress httpd_address_inet(HttpdStr host, int port) {
   return addr;
 }
 
-HttpdAddress httpd_address_unix(HttpdStr path) {
+HttpdAddress httpd_address_unx(HttpdStr path) {
   HttpdAddress addr = {.domain = AF_UNIX};
-  memset(&addr.unix, 0, sizeof(addr.unix));
-  addr.unix.sun_family = AF_UNIX;
-  strncpy(addr.unix.sun_path, path.data, path.size);
+  memset(&addr.unx, 0, sizeof(addr.unx));
+  addr.unx.sun_family = AF_UNIX;
+  strncpy(addr.unx.sun_path, path.data, path.size);
   return addr;
 }
 
 HttpdAddress httpd_address_url(HttpdStr url) {
-  const HttpdStr unix = STR("unix://");
+  const HttpdStr unx = STR("unix://");
   const HttpdStr tcp = STR("tcp://");
-  if (httpd_str_starts_with(url, unix)) {
-    HttpdStr path = httpd_str_trim_left(url, unix.size);
-    return httpd_address_unix(path);
+  if (httpd_str_starts_with(url, unx)) {
+    HttpdStr path = httpd_str_trim_left(url, unx.size);
+    return httpd_address_unx(path);
   }
   url = httpd_str_trim_left(url, tcp.size);
   size_t index = 0;
@@ -269,9 +269,9 @@ int httpd_connection_connect(HttpdConnection *conn, HttpdAddress addr) {
   socklen_t socklen;
   struct sockaddr *address;
   if (addr.domain == AF_UNIX) {
-    unlink(addr.unix.sun_path);
-    socklen = sizeof(addr.unix);
-    address = (struct sockaddr *)&addr.unix;
+    unlink(addr.unx.sun_path);
+    socklen = sizeof(addr.unx);
+    address = (struct sockaddr *)&addr.unx;
   } else {
     TRY_CATCH(httpd_isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1), close(fd));
     TRY_CATCH(httpd_isetsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1), close(fd));
@@ -315,6 +315,45 @@ void httpd_connection_close(HttpdConnection *conn) {
 
 // HTTP ----------------------------------------------------------------------
 
+const HttpdStr MGET = STR("GET");
+const HttpdStr MPUT = STR("PUT");
+const HttpdStr MPOST = STR("POST");
+const HttpdStr MDELETE = STR("DELETE");
+const HttpdStr MPATCH = STR("PATCH");
+const HttpdStr MHEAD = STR("HEAD");
+const HttpdStr MOPTIONS = STR("OPTIONS");
+
+typedef enum {
+  METHOD_GET = 1 << 0,
+  METHOD_POST = 1 << 1,
+  METHOD_PUT = 1 << 2,
+  METHOD_DELETE = 1 << 3,
+  METHOD_PATCH = 1 << 4,
+  METHOD_HEAD = 1 << 5,
+  METHOD_OPTIONS = 1 << 6,
+  METHOD_ANY = 0xFF
+} HttpdMethod;
+
+int httpd_method_parse(HttpdStr m) {
+  if (!m.size)
+    return 0;
+  if (httpd_str_eq(m, MGET))
+    return METHOD_GET;
+  if (httpd_str_eq(m, MPUT))
+    return METHOD_PUT;
+  if (httpd_str_eq(m, MPOST))
+    return METHOD_POST;
+  if (httpd_str_eq(m, MDELETE))
+    return METHOD_DELETE;
+  if (httpd_str_eq(m, MPATCH))
+    return METHOD_PATCH;
+  if (httpd_str_eq(m, MHEAD))
+    return METHOD_HEAD;
+  if (httpd_str_eq(m, MOPTIONS))
+    return METHOD_OPTIONS;
+  return METHOD_ANY;
+}
+
 typedef enum {
   s200 = 200,
   s304 = 304,
@@ -348,7 +387,7 @@ typedef struct {
   int fd;
   HttpdStr payload;
   HttpdStr status_line;
-  HttpdStr method;
+  int method;
   HttpdStr path;
   HttpdStr protocol;
   HttpdStr header;
@@ -359,9 +398,10 @@ HttpdRequest httpd_request_new(HttpdStr data) {
   // GET /path HTTP/1.1
   HttpdRequest req = {.payload = data,
                       .status_line = httpd_str_subc(data, '\r')};
-  req.method = httpd_str_subc(req.status_line, ' ');
+  HttpdStr method = httpd_str_subc(req.status_line, ' ');
+  req.method = httpd_method_parse(method);
   HttpdStr rest_status_line =
-      httpd_str_trim_left(req.status_line, req.method.size + 1);
+      httpd_str_trim_left(req.status_line, method.size + 1);
   req.path = httpd_str_subc(rest_status_line, ' ');
   req.protocol = httpd_str_trim_left(rest_status_line, req.path.size + 1);
 
@@ -408,6 +448,7 @@ HttpdStr httpd_header_get_header(HttpdHeader *headers, int n, HttpdStr name) {
 typedef int (*HttpdRequestHandler)(HttpdRequest *);
 
 typedef struct {
+  int method;
   HttpdStr path;
   HttpdRequestHandler handler;
 } HttpdRoute;
@@ -418,10 +459,13 @@ typedef struct {
   HttpdRoute NotFound;
 } HttpdRouter;
 
-HttpdRequestHandler HttpdRouter_find(HttpdRouter *router, HttpdStr path) {
+HttpdRequestHandler HttpdRouter_find(HttpdRouter *router, HttpdRequest *req) {
   for (size_t i = 0; i < router->size; ++i) {
-    if (httpd_str_eq(path, router->routes[i].path)) {
-      return router->routes[i].handler;
+    const HttpdRoute *route = &router->routes[i];
+    if(req->method && route->method) {
+        if (httpd_str_eq(req->path, router->routes[i].path)) {
+          return router->routes[i].handler;
+        }
     }
   }
   return router->NotFound.handler;
@@ -490,7 +534,7 @@ int httpd_server_handle_request(HttpdServer *s, int fd) {
 
 #ifdef HTTPD_ELOG
   httpd_elog(STR_Fmt " START\n", STR_Arg(req.status_line));
-  HttpdRequestHandler func = HttpdRouter_find(&s->router, req.path);
+  HttpdRequestHandler func = HttpdRouter_find(&s->router, &req);
   int result = func(&req);
   clock_gettime(CLOCK_MONOTONIC, &end);
   HttpdStr dt = httpd_time_delta(&start, &end, logbuf, sizeof(logbuf));
@@ -498,7 +542,7 @@ int httpd_server_handle_request(HttpdServer *s, int fd) {
              STR_Arg(dt));
   return result;
 #else
-  HttpdRequestHandler func = HttpdRouter_find(&s->router, req.path);
+  HttpdRequestHandler func = HttpdRouter_find(&s->router, &req);
   return func(&req);
 #endif
 }
