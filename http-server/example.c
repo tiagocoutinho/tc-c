@@ -1,6 +1,6 @@
 // #define HTTPD_ELOG
 #define HTTPD_IMPLEMENTATION
-
+#define HTTPD_ELOG
 #include "httpd.h"
 
 int about_page(HttpdRequest *request) {
@@ -27,16 +27,36 @@ int not_found(HttpdRequest *request) {
 int info_page(HttpdRequest *request) {
   const int N = 8 * 1024;
   char buf[N];
+  HttpdStrIO out = httpd_str_io(buf, N);
 
-  HttpdHeader headers[100];
-  int n = httpd_request_headers(request, headers, 100);
-  int size =
-      snprintf(buf, N, "<p>" STR_Fmt "</p>", STR_Arg(request->status_line));
-  for (int i = 0; i < n; ++i) {
-    size += snprintf(buf + size, N - size, STR_Fmt ": " STR_Fmt "<br/>",
-                     STR_Arg(headers[i].name), STR_Arg(headers[i].value));
+  httpd_strio_printf(&out,
+                     "<h3>Status line</h3>"
+                     "<code>" STR_Fmt "</code>"
+                     "<h3>Path</h3>"
+                     "<pre><code>"
+                     "Full path: " STR_Fmt "\n"
+                     "  Path: " STR_Fmt "\n"
+                     "  Query: " STR_Fmt "\n",
+                     STR_Arg(request->status_line), STR_Arg(request->full_path),
+                     STR_Arg(request->path), STR_Arg(request->query));
+
+  HttpdQueryIterator qit = httpd_request_query_iterator(request);
+
+  while (qit.query.size) {
+    HttpdQueryParam param = httpd_query_iterator_next(&qit);
+    httpd_strio_printf(&out, "    " STR_Fmt " = " STR_Fmt "\n",
+                       STR_Arg(param.key), STR_Arg(param.value));
   }
-  HttpdStr response = httpd_str_from_parts(buf, size);
+  httpd_strio_printf(&out, "</code></pre><h3>Headers</h3><pre><code>");
+
+  HttpdHeaderIterator hit = httpd_request_header_iterator(request);
+  while (hit.header.size) {
+    HttpdHeader header = httpd_header_iterator_next(&hit);
+    httpd_strio_printf(&out, STR_Fmt ": " STR_Fmt "\n", STR_Arg(header.name),
+                       STR_Arg(header.value));
+  }
+
+  HttpdStr response = httpd_strio_str(out);
   return httpd_request_send_static(request, S200, MIME_HTML, response);
 }
 
@@ -47,13 +67,9 @@ int run(HttpdAddress addr) {
   serv.router = (HttpdRouter){
       .routes =
           (HttpdRoute[]){
-              {.handler = home_page, .method = METHOD_GET, .path = STR("/")},
-              {.handler = about_page,
-               .method = METHOD_ANY,
-               .path = STR("/about")},
-              {.handler = info_page,
-               .method = METHOD_GET,
-               .path = STR("/info")},
+              {.handler = home_page, .path = STR("/")},
+              {.handler = about_page, .path = STR("/about")},
+              {.handler = info_page, .path = STR("/info")},
           },
       .size = 3,
       .NotFound = {.handler = not_found, .path = STR_NULL},

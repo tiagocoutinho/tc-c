@@ -88,10 +88,6 @@ HttpdStr httpd_str_from_parts(const char *d, size_t s) {
   return (HttpdStr){.size = s, .data = d};
 }
 
-HttpdStr httpd_str_from_c0(const char *d) {
-  return (HttpdStr){.size = strlen(d), .data = d};
-}
-
 bool httpd_str_index(HttpdStr str, char c, size_t *index) {
   for (size_t i = 0; i < str.size; ++i) {
     if (str.data[i] == c) {
@@ -180,6 +176,27 @@ bool httpd_str_ends_with(HttpdStr str, HttpdStr suffix) {
     return httpd_str_eq(actual_suffix, suffix);
   }
   return false;
+}
+
+typedef struct {
+  char *buf;
+  size_t max_size;
+  size_t size;
+} HttpdStrIO;
+
+HttpdStrIO httpd_str_io(char *buf, size_t max_size) {
+  return (HttpdStrIO){.buf = buf, .max_size = max_size, .size = 0};
+}
+
+void httpd_strio_printf(HttpdStrIO *s, const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  s->size += vsnprintf(s->buf + s->size, s->max_size - s->size, format, args);
+  va_end(args);
+}
+
+HttpdStr httpd_strio_str(HttpdStrIO s) {
+  return httpd_str_from_parts(s.buf, s.size);
 }
 
 // Tools ---------------------------------------------------------------------
@@ -324,6 +341,7 @@ const HttpdStr MHEAD = STR("HEAD");
 const HttpdStr MOPTIONS = STR("OPTIONS");
 
 typedef enum {
+  METHOD_ANY = 0,
   METHOD_GET = 1 << 0,
   METHOD_POST = 1 << 1,
   METHOD_PUT = 1 << 2,
@@ -331,7 +349,6 @@ typedef enum {
   METHOD_PATCH = 1 << 4,
   METHOD_HEAD = 1 << 5,
   METHOD_OPTIONS = 1 << 6,
-  METHOD_ANY = 0xFF
 } HttpdMethod;
 
 int httpd_method_parse(HttpdStr m) {
@@ -380,19 +397,100 @@ typedef struct {
   HttpdStr value;
 } HttpdHeader;
 
+// HttpdQuery
+
+typedef struct {
+  HttpdStr key;
+  HttpdStr value;
+} HttpdQueryParam;
+
+typedef struct {
+  HttpdStr query;
+} HttpdQueryIterator;
+
+HttpdQueryIterator httpd_query_iterator(HttpdStr query) {
+  return (HttpdQueryIterator){.query = query};
+}
+
+HttpdQueryParam httpd_query_iterator_next(HttpdQueryIterator *q) {
+  if (!q->query.size) {
+    return (HttpdQueryParam){};
+  }
+  size_t field_sep = 0;
+  httpd_str_index(q->query, '=', &field_sep);
+  HttpdQueryParam r = {
+      .key = httpd_str_from_parts(q->query.data, field_sep),
+  };
+  size_t field_end = 0;
+  if (!httpd_str_index(q->query, '&', &field_end)) {
+    field_end = q->query.size;
+  }
+  r.value = httpd_str_from_parts(q->query.data + field_sep + 1,
+                                 field_end - field_sep - 1);
+  httpd_str_self_trim_left(&q->query, field_end + 1);
+  return r;
+};
+
+// HttpdHeaderIterator -------------------------------------------------------
+
+typedef struct {
+  HttpdStr header;
+
+} HttpdHeaderIterator;
+
+HttpdHeaderIterator httpd_header_iterator(HttpdStr header) {
+    printf("HEADERS = '" STR_Fmt "'\n", STR_Arg(header));
+  return (HttpdHeaderIterator){.header = header};
+}
+
+HttpdHeader httpd_header_iterator_next(HttpdHeaderIterator *it) {
+    if (!it->header.size) {
+        return (HttpdHeader){};
+    }
+    size_t field_sep = 0;
+    httpd_str_index(it->header, ':', &field_sep);
+    HttpdHeader r = {
+        .name = httpd_str_from_parts(it->header.data, field_sep),
+    };
+    size_t field_end = 0;
+    if (!httpd_str_indexstr(it->header, STR(CRLF), &field_end)) {
+      field_end = it->header.size;
+    }
+    r.value = httpd_str_from_parts(it->header.data + field_sep + 1,
+            field_end - field_sep - 1);
+    printf("HEADER '" STR_Fmt "' = '" STR_Fmt "'\n", STR_Arg(r.name),STR_Arg(r.value));
+    r.value = httpd_str_strip(r.value);
+
+    httpd_str_self_trim_left(&it->header, field_end + 2);
+    return r;
+}
+
 // HttpdRequest
 // -------------------------------------------------------------------
 
 typedef struct {
   int fd;
   HttpdStr payload;
+
   HttpdStr status_line;
   int method;
+
+  HttpdStr full_path;
   HttpdStr path;
+  HttpdStr query;
   HttpdStr protocol;
+
   HttpdStr header;
   HttpdStr body;
 } HttpdRequest;
+
+void httpd_request_parse_status_path(HttpdRequest *req) {
+  size_t query_index = req->full_path.size;
+  if (httpd_str_index(req->full_path, '?', &query_index)) {
+    req->query = httpd_str_trim_left(req->full_path, query_index + 1);
+  }
+  req->path = httpd_str_from_parts(req->full_path.data, query_index);
+}
 
 HttpdRequest httpd_request_new(HttpdStr data) {
   // GET /path HTTP/1.1
@@ -402,41 +500,34 @@ HttpdRequest httpd_request_new(HttpdStr data) {
   req.method = httpd_method_parse(method);
   HttpdStr rest_status_line =
       httpd_str_trim_left(req.status_line, method.size + 1);
-  req.path = httpd_str_subc(rest_status_line, ' ');
-  req.protocol = httpd_str_trim_left(rest_status_line, req.path.size + 1);
+  req.full_path = httpd_str_subc(rest_status_line, ' ');
+
+  httpd_request_parse_status_path(&req);
+
+  req.protocol = httpd_str_trim_left(rest_status_line, req.full_path.size + 1);
 
   httpd_str_self_trim_left(&data, req.status_line.size + 2);
   size_t hb_index = 0;
   httpd_str_indexstr(data, HEADER_BODY_SEPARATOR, &hb_index);
-  req.header = httpd_str_from_parts(data.data, hb_index + 1);
+  req.header = httpd_str_from_parts(data.data, hb_index + 2);
   req.body = httpd_str_trim_left(data, hb_index + 2);
   return req;
 }
 
-int httpd_request_headers(HttpdRequest *req, HttpdHeader *headers,
-                          size_t max_size) {
-  HttpdStr header = req->header;
-  size_t index, sep = 0;
-  for (int i = 0; i < max_size; ++i) {
-    if (httpd_str_index(header, '\r', &index) == false) {
-      return i;
-    }
-    HttpdStr line = httpd_str_from_parts(header.data, index);
-    httpd_str_index(line, ':', &sep);
-    HttpdStr value =
-        httpd_str_from_parts(line.data + sep + 1, line.size - (sep + 1));
-    value = httpd_str_strip(value);
-    headers[i] = (HttpdHeader){.name = httpd_str_from_parts(line.data, sep),
-                               .value = value};
-    header = httpd_str_trim_left(header, line.size + 2);
-  }
-  return 0;
+HttpdQueryIterator httpd_request_query_iterator(HttpdRequest *req) {
+  return httpd_query_iterator(req->query);
 }
 
-HttpdStr httpd_header_get_header(HttpdHeader *headers, int n, HttpdStr name) {
-  for (int i = 0; i < n; ++i) {
-    if (httpd_str_eq(headers[i].name, name)) {
-      return headers[i].value;
+HttpdHeaderIterator httpd_request_header_iterator(HttpdRequest *req) {
+  return httpd_header_iterator(req->header);
+}
+
+HttpdStr httpd_request_get_header(HttpdRequest *req, HttpdStr name) {
+  HttpdHeaderIterator it = httpd_request_header_iterator(req);
+  while (it.header.size) {
+    HttpdHeader header = httpd_header_iterator_next(&it);
+    if (httpd_str_eq(header.name, name)) {
+        return header.value;
     }
   }
   return STR_NULL;
@@ -462,10 +553,10 @@ typedef struct {
 HttpdRequestHandler HttpdRouter_find(HttpdRouter *router, HttpdRequest *req) {
   for (size_t i = 0; i < router->size; ++i) {
     const HttpdRoute *route = &router->routes[i];
-    if(req->method && route->method) {
-        if (httpd_str_eq(req->path, router->routes[i].path)) {
-          return router->routes[i].handler;
-        }
+    if (!route->method || (req->method && route->method)) {
+      if (httpd_str_eq(req->path, router->routes[i].path)) {
+        return router->routes[i].handler;
+      }
     }
   }
   return router->NotFound.handler;
@@ -647,10 +738,7 @@ int httpd_raw_send_file(HttpdRequest *req, const char *filename,
 }
 
 int httpd_request_send_file(HttpdRequest *req, HttpdStr filename) {
-  HttpdHeader headers[100];
-  int n = httpd_request_headers(req, headers, 100);
-  HttpdStr etag = httpd_header_get_header(headers, n, STR("If-None-Match"));
-
+  HttpdStr etag = httpd_request_get_header(req, STR("If-None-Match"));
   HttpdStr mime = MIME_PLAIN;
   if (httpd_str_ends_with(filename, STR(".html"))) {
     mime = MIME_HTML;
