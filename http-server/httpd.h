@@ -232,6 +232,7 @@ HttpdStr httpd_time_delta(const struct timespec *start,
 typedef struct {
   int domain;
   union {
+    struct sockaddr address;
     struct sockaddr_in inet;
     struct sockaddr_un unx;
   };
@@ -270,6 +271,11 @@ HttpdAddress httpd_address_url(HttpdStr url) {
   return httpd_address_inet(host, port);
 }
 
+int httpd_address_len(HttpdAddress *address) {
+  return address->domain == AF_UNIX ? sizeof(address->unx)
+                                    : sizeof(address->inet);
+}
+
 // HttpdConnection
 // ----------------------------------------------------------------
 
@@ -283,20 +289,15 @@ int httpd_connection_connect(HttpdConnection *conn, HttpdAddress addr) {
   conn->fd = -1;
   int fd;
   TRY(fd = socket(addr.domain, SOCK_STREAM | SOCK_NONBLOCK, 0));
-  socklen_t socklen;
-  struct sockaddr *address;
+  socklen_t socklen = httpd_address_len(&addr);
   if (addr.domain == AF_UNIX) {
     unlink(addr.unx.sun_path);
-    socklen = sizeof(addr.unx);
-    address = (struct sockaddr *)&addr.unx;
   } else {
     TRY_CATCH(httpd_isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1), close(fd));
     TRY_CATCH(httpd_isetsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1), close(fd));
     TRY_CATCH(httpd_isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
-    socklen = sizeof(addr.inet);
-    address = (struct sockaddr *)&addr.inet;
   }
-  TRY_CATCH(bind(fd, address, socklen), close(fd));
+  TRY_CATCH(bind(fd, &addr.address, socklen), close(fd));
   TRY_CATCH(listen(fd, HTTPD_LISTEN_BACKLOG), close(fd));
   conn->fd = fd;
   return 0;
@@ -304,23 +305,19 @@ int httpd_connection_connect(HttpdConnection *conn, HttpdAddress addr) {
 
 int httpd_connection_accept(HttpdConnection *conn) {
   int fd, flags;
+  HttpdAddress peer = {.domain = conn->addr.domain};
+  socklen_t addr_len = httpd_address_len(&peer);
+  TRY(fd = accept(conn->fd, &peer.address, &addr_len));
+  TRY(flags = fcntl(fd, F_GETFL, 0));
+  TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+
   if (conn->addr.domain == AF_UNIX) {
-    struct sockaddr_un addr;
-    socklen_t addr_len = sizeof(addr);
-    TRY(fd = accept(conn->fd, (struct sockaddr *)&addr, &addr_len));
-    TRY(flags = fcntl(fd, F_GETFL, 0));
-    TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
-    httpd_elog("Received connection from %s", addr.sun_path);
+    httpd_elog("Received connection from %s", peer.unx.sun_path);
   } else {
-    struct sockaddr_in peer;
-    socklen_t addr_len = sizeof(peer);
-    TRY(fd = accept(conn->fd, (struct sockaddr *)&peer, &addr_len));
-    TRY(flags = fcntl(fd, F_GETFL, 0));
-    TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
     TRY_CATCH(httpd_isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
     char buf[128];
-    inet_ntop(AF_INET, &peer.sin_addr, buf, sizeof(buf));
-    httpd_elog("Received connection from %s:%d\n", buf, peer.sin_port);
+    inet_ntop(AF_INET, &peer.inet.sin_addr, buf, sizeof(buf));
+    httpd_elog("Received connection from %s:%d\n", buf, peer.inet.sin_port);
   }
   return fd;
 }
@@ -400,7 +397,6 @@ typedef struct {
   size_t _buf_size;
 } HttpdIterator;
 
-
 HttpdIterator httpd_iterator(HttpdStr data) {
   return (HttpdIterator){.data = data, ._buf_size = 0};
 }
@@ -418,7 +414,8 @@ HttpdKeyValue httpd_iterator_next(HttpdIterator *q) {
       .key = httpd_str_from_parts(q->data.data, field_sep),
 
   };
-  HttpdStr raw_value = httpd_str_from_parts(q->data.data + field_sep + 1, field_end - field_sep - 1);
+  HttpdStr raw_value = httpd_str_from_parts(q->data.data + field_sep + 1,
+                                            field_end - field_sep - 1);
   httpd_str_self_trim_left(&q->data, field_end + 1);
   size_t percent;
   if (httpd_str_index(raw_value, '%', &percent)) {
@@ -443,8 +440,9 @@ HttpdKeyValue httpd_iterator_next(HttpdIterator *q) {
 
 // HttpdQuery ----------------------------------------------------------------
 
-HttpdIterator (*const httpd_query_iterator)(HttpdStr ) = httpd_iterator; 
-HttpdKeyValue (*const httpd_query_iterator_next)(HttpdIterator* ) = httpd_iterator_next;
+HttpdIterator (*const httpd_query_iterator)(HttpdStr) = httpd_iterator;
+HttpdKeyValue (*const httpd_query_iterator_next)(HttpdIterator *) =
+    httpd_iterator_next;
 
 // HttpdHeaderIterator -------------------------------------------------------
 
@@ -478,8 +476,9 @@ HttpdHeader httpd_header_iterator_next(HttpdHeaderIterator *it) {
 
 // HttpdFormIterator ---------------------------------------------------------
 
-HttpdIterator (*const httpd_form_iterator)(HttpdStr ) = httpd_iterator; 
-HttpdKeyValue (*const httpd_form_iterator_next)(HttpdIterator* ) = httpd_iterator_next;
+HttpdIterator (*const httpd_form_iterator)(HttpdStr) = httpd_iterator;
+HttpdKeyValue (*const httpd_form_iterator_next)(HttpdIterator *) =
+    httpd_iterator_next;
 
 // HttpdRequest --------------------------------------------------------------
 

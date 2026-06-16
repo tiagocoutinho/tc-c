@@ -1,4 +1,4 @@
-#define HTTPD_ELOG
+//#define HTTPD_ELOG
 #define HTTPD_IMPLEMENTATION
 
 #include "httpd.h"
