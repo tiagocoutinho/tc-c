@@ -1,5 +1,5 @@
 #define HTTPD_IMPLEMENTATION
-#define HTTPD_ELOG
+//#define HTTPD_ELOG
 #include "httpd.h"
 
 int about_page(HttpdRequest *request) {

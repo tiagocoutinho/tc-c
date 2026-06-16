@@ -70,8 +70,7 @@ int httpd_isetsockopt(int fd, int level, int option, int value) {
     return -1;                                                                 \
   }
 
-// HttpdStr
-// -----------------------------------------------------------------------
+// HttpdStr ------------------------------------------------------------------
 
 typedef struct {
   size_t size;
@@ -178,6 +177,8 @@ bool httpd_str_ends_with(HttpdStr str, HttpdStr suffix) {
   return false;
 }
 
+// HttpdStrIO ----------------------------------------------------------------
+
 typedef struct {
   char *buf;
   size_t max_size;
@@ -276,8 +277,7 @@ int httpd_address_len(HttpdAddress *address) {
                                     : sizeof(address->inet);
 }
 
-// HttpdConnection
-// ----------------------------------------------------------------
+// HttpdConnection -----------------------------------------------------------
 
 typedef struct {
   HttpdAddress addr;
@@ -551,8 +551,7 @@ HttpdStr httpd_request_get_header(HttpdRequest *req, HttpdStr name) {
   return STR_NULL;
 }
 
-// HttpdRouter
-// --------------------------------------------------------------------
+// HttpdRouter ---------------------------------------------------------------
 
 typedef int (*HttpdRequestHandler)(HttpdRequest *);
 
@@ -580,8 +579,7 @@ HttpdRequestHandler HttpdRouter_find(HttpdRouter *router, HttpdRequest *req) {
   return router->NotFound.handler;
 }
 
-// HttpdServer
-// --------------------------------------------------------------------
+// HttpdServer  --------------------------------------------------------------
 
 typedef struct {
   HttpdConnection connection;
