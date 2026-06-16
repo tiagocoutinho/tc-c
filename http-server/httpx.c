@@ -46,10 +46,10 @@ int view_contact(HttpdRequest *request) {
 
 int update_contact(HttpdRequest *request) {
 
-  HttpdFormIterator it = httpd_request_form_iterator(request);
+  HttpdIterator it = httpd_request_form_iterator(request);
 
   while (it.data.size) {
-    HttpdFormParam param = httpd_form_iterator_next(&it);
+    HttpdKeyValue param = httpd_form_iterator_next(&it);
     if (httpd_str_eq(param.key, STR("firstName"))) {
       memset(user.first_name, 0, sizeof(user.first_name));
       memcpy(user.first_name, param.value.data, param.value.size);

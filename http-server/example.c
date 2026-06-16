@@ -1,4 +1,3 @@
-// #define HTTPD_ELOG
 #define HTTPD_IMPLEMENTATION
 #define HTTPD_ELOG
 #include "httpd.h"
@@ -40,10 +39,10 @@ int info_page(HttpdRequest *request) {
                      STR_Arg(request->status_line), STR_Arg(request->full_path),
                      STR_Arg(request->path), STR_Arg(request->query));
 
-  HttpdQueryIterator qit = httpd_request_query_iterator(request);
+  HttpdIterator qit = httpd_request_query_iterator(request);
 
   while (qit.data.size) {
-    HttpdQueryParam param = httpd_query_iterator_next(&qit);
+    HttpdKeyValue param = httpd_query_iterator_next(&qit);
     httpd_strio_printf(&out, "    " STR_Fmt " = " STR_Fmt "\n",
                        STR_Arg(param.key), STR_Arg(param.value));
   }

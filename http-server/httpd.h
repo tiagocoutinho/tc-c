@@ -396,35 +396,55 @@ typedef struct {
 
 typedef struct {
   HttpdStr data;
+  char _buf[4096];
+  size_t _buf_size;
 } HttpdIterator;
 
-// HttpdQuery ----------------------------------------------------------------
 
-typedef HttpdKeyValue HttpdQueryParam;
-typedef HttpdIterator HttpdQueryIterator;
-
-HttpdQueryIterator httpd_query_iterator(HttpdStr data) {
-  return (HttpdQueryIterator){.data = data};
+HttpdIterator httpd_iterator(HttpdStr data) {
+  return (HttpdIterator){.data = data, ._buf_size = 0};
 }
 
-HttpdQueryParam httpd_query_iterator_next(HttpdQueryIterator *q) {
+HttpdKeyValue httpd_iterator_next(HttpdIterator *q) {
   if (!q->data.size) {
-    return (HttpdQueryParam){};
+    return (HttpdKeyValue){};
   }
-  size_t field_sep = 0;
+  size_t field_sep = 0, field_end = 0;
   httpd_str_index(q->data, '=', &field_sep);
-  HttpdKeyValue r = {
-      .key = httpd_str_from_parts(q->data.data, field_sep),
-  };
-  size_t field_end = 0;
   if (!httpd_str_index(q->data, '&', &field_end)) {
     field_end = q->data.size;
   }
-  r.value = httpd_str_from_parts(q->data.data + field_sep + 1,
-                                 field_end - field_sep - 1);
+  HttpdKeyValue r = {
+      .key = httpd_str_from_parts(q->data.data, field_sep),
+
+  };
+  HttpdStr raw_value = httpd_str_from_parts(q->data.data + field_sep + 1, field_end - field_sep - 1);
   httpd_str_self_trim_left(&q->data, field_end + 1);
+  size_t percent;
+  if (httpd_str_index(raw_value, '%', &percent)) {
+    char *out = q->_buf + q->_buf_size;
+    r.value = httpd_str_from_parts(out, 0);
+    for (size_t i = 0; i < raw_value.size; ++i) {
+      char c = raw_value.data[i];
+      if (c == '%') {
+        char hex[3] = {raw_value.data[i + 1], raw_value.data[i + 2], '\0'};
+        c = (char)strtol(hex, NULL, 16);
+        i += 2;
+      }
+      *out++ = c;
+      r.value.size += 1;
+    }
+    q->_buf_size += r.value.size;
+  } else {
+    r.value = raw_value;
+  }
   return r;
 };
+
+// HttpdQuery ----------------------------------------------------------------
+
+HttpdIterator (*const httpd_query_iterator)(HttpdStr ) = httpd_iterator; 
+HttpdKeyValue (*const httpd_query_iterator_next)(HttpdIterator* ) = httpd_iterator_next;
 
 // HttpdHeaderIterator -------------------------------------------------------
 
@@ -436,56 +456,32 @@ HttpdHeaderIterator httpd_header_iterator(HttpdStr data) {
 }
 
 HttpdHeader httpd_header_iterator_next(HttpdHeaderIterator *it) {
-    if (!it->data.size) {
-        return (HttpdHeader){};
-    }
-    size_t field_sep = 0;
-    httpd_str_index(it->data, ':', &field_sep);
-    HttpdHeader r = {
-        .key = httpd_str_from_parts(it->data.data, field_sep),
-    };
-    size_t field_end = 0;
-    if (!httpd_str_indexstr(it->data, STR(CRLF), &field_end)) {
-      field_end = it->data.size;
-    }
-    r.value = httpd_str_from_parts(it->data.data + field_sep + 1,
-            field_end - field_sep - 1);
-    r.value = httpd_str_strip(r.value);
+  if (!it->data.size) {
+    return (HttpdHeader){};
+  }
+  size_t field_sep = 0;
+  httpd_str_index(it->data, ':', &field_sep);
+  HttpdHeader r = {
+      .key = httpd_str_from_parts(it->data.data, field_sep),
+  };
+  size_t field_end = 0;
+  if (!httpd_str_indexstr(it->data, STR(CRLF), &field_end)) {
+    field_end = it->data.size;
+  }
+  r.value = httpd_str_from_parts(it->data.data + field_sep + 1,
+                                 field_end - field_sep - 1);
+  r.value = httpd_str_strip(r.value);
 
-    httpd_str_self_trim_left(&it->data, field_end + 2);
-    return r;
+  httpd_str_self_trim_left(&it->data, field_end + 2);
+  return r;
 }
 
 // HttpdFormIterator ---------------------------------------------------------
 
-typedef HttpdKeyValue HttpdFormParam;
-typedef HttpdIterator HttpdFormIterator;
+HttpdIterator (*const httpd_form_iterator)(HttpdStr ) = httpd_iterator; 
+HttpdKeyValue (*const httpd_form_iterator_next)(HttpdIterator* ) = httpd_iterator_next;
 
-HttpdFormIterator httpd_form_iterator(HttpdStr data) {
-  return (HttpdQueryIterator){.data = data};
-}
-
-HttpdFormParam httpd_form_iterator_next(HttpdQueryIterator *q) {
-  if (!q->data.size) {
-    return (HttpdFormParam){};
-  }
-  size_t field_sep = 0;
-  httpd_str_index(q->data, '=', &field_sep);
-  HttpdKeyValue r = {
-      .key = httpd_str_from_parts(q->data.data, field_sep),
-  };
-  size_t field_end = 0;
-  if (!httpd_str_index(q->data, '&', &field_end)) {
-    field_end = q->data.size;
-  }
-  r.value = httpd_str_from_parts(q->data.data + field_sep + 1,
-                                 field_end - field_sep - 1);
-  httpd_str_self_trim_left(&q->data, field_end + 1);
-  return r;
-};
-
-// HttpdRequest
-// -------------------------------------------------------------------
+// HttpdRequest --------------------------------------------------------------
 
 typedef struct {
   int fd;
@@ -529,12 +525,11 @@ HttpdRequest httpd_request_new(HttpdStr data) {
   size_t hb_index = 0;
   httpd_str_indexstr(data, HEADER_BODY_SEPARATOR, &hb_index);
   req.header = httpd_str_from_parts(data.data, hb_index + 2);
-//  req.body = httpd_str_from_parts(data.data + hb_index + sizeof(CRLF CRLF), 
   req.body = httpd_str_trim_left(data, hb_index + 4);
   return req;
 }
 
-HttpdQueryIterator httpd_request_query_iterator(HttpdRequest *req) {
+HttpdIterator httpd_request_query_iterator(HttpdRequest *req) {
   return httpd_query_iterator(req->query);
 }
 
@@ -542,8 +537,8 @@ HttpdHeaderIterator httpd_request_header_iterator(HttpdRequest *req) {
   return httpd_header_iterator(req->header);
 }
 
-HttpdFormIterator httpd_request_form_iterator(HttpdRequest *req) {
-    return httpd_form_iterator(req->body);
+HttpdIterator httpd_request_form_iterator(HttpdRequest *req) {
+  return httpd_form_iterator(req->body);
 }
 
 HttpdStr httpd_request_get_header(HttpdRequest *req, HttpdStr name) {
@@ -551,7 +546,7 @@ HttpdStr httpd_request_get_header(HttpdRequest *req, HttpdStr name) {
   while (it.data.size) {
     HttpdHeader header = httpd_header_iterator_next(&it);
     if (httpd_str_eq(header.key, name)) {
-        return header.value;
+      return header.value;
     }
   }
   return STR_NULL;
