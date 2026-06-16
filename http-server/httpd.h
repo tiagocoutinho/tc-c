@@ -97,6 +97,16 @@ bool httpd_str_index(HttpdStr str, char c, size_t *index) {
   return false;
 }
 
+bool httpd_str_rindex(HttpdStr str, char c, size_t *index) {
+  for (size_t i = str.size - 1; i >= 0; --i) {
+    if (str.data[i] == c) {
+      *index = i;
+      return true;
+    }
+  }
+  return false;
+}
+
 HttpdStr httpd_str_subc(HttpdStr str, char c) {
   size_t index;
   if (httpd_str_index(str, c, &index)) {
@@ -235,6 +245,7 @@ typedef struct {
   union {
     struct sockaddr address;
     struct sockaddr_in inet;
+    struct sockaddr_in6 inet6;
     struct sockaddr_un unx;
   };
 } HttpdAddress;
@@ -249,6 +260,16 @@ HttpdAddress httpd_address_inet(HttpdStr host, int port) {
   return addr;
 }
 
+HttpdAddress httpd_address_inet6(HttpdStr host, int port) {
+  HttpdAddress addr = {.domain = AF_INET6};
+  if (inet_pton(AF_INET6, host.data, &addr.inet6.sin6_addr) == -1) {
+    return addr;
+  };
+  addr.inet6.sin6_family = AF_INET6;
+  addr.inet6.sin6_port = htons(port);
+  return addr;
+}
+
 HttpdAddress httpd_address_unx(HttpdStr path) {
   HttpdAddress addr = {.domain = AF_UNIX};
   memset(&addr.unx, 0, sizeof(addr.unx));
@@ -260,9 +281,17 @@ HttpdAddress httpd_address_unx(HttpdStr path) {
 HttpdAddress httpd_address_url(HttpdStr url) {
   const HttpdStr unx = STR("unix://");
   const HttpdStr tcp = STR("tcp://");
+  const HttpdStr tcp6 = STR("tcp6://");
   if (httpd_str_starts_with(url, unx)) {
     HttpdStr path = httpd_str_trim_left(url, unx.size);
     return httpd_address_unx(path);
+  } else if (httpd_str_starts_with(url, tcp6)) {
+    url = httpd_str_trim_left(url, tcp6.size);
+    size_t index = 0;
+    httpd_str_rindex(url, ':', &index);
+    const HttpdStr host = httpd_str_from_parts(url.data, index);
+    const int port = atoi(url.data + index + 1);
+    return httpd_address_inet6(host, port);
   }
   url = httpd_str_trim_left(url, tcp.size);
   size_t index = 0;
@@ -273,8 +302,13 @@ HttpdAddress httpd_address_url(HttpdStr url) {
 }
 
 int httpd_address_len(HttpdAddress *address) {
-  return address->domain == AF_UNIX ? sizeof(address->unx)
-                                    : sizeof(address->inet);
+  if (address->domain == AF_INET) {
+    return sizeof(address->inet);
+  }
+  if (address->domain == AF_INET6) {
+    return sizeof(address->inet6);
+  }
+  return sizeof(address->unx);
 }
 
 // HttpdConnection -----------------------------------------------------------
@@ -316,8 +350,13 @@ int httpd_connection_accept(HttpdConnection *conn) {
   } else {
     TRY_CATCH(httpd_isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
     char buf[128];
-    inet_ntop(AF_INET, &peer.inet.sin_addr, buf, sizeof(buf));
-    httpd_elog("Received connection from %s:%d\n", buf, peer.inet.sin_port);
+    if (conn->addr.domain == AF_INET) {
+      inet_ntop(AF_INET, &peer.inet.sin_addr, buf, sizeof(buf));
+      httpd_elog("Received connection from %s:%d\n", buf, peer.inet.sin_port);
+    } else {
+      inet_ntop(AF_INET6, &peer.inet6.sin6_addr, buf, sizeof(buf));
+      httpd_elog("Received connection from %s:%d\n", buf, peer.inet6.sin6_port);
+    }
   }
   return fd;
 }
