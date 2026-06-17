@@ -29,6 +29,10 @@
 #define HTTPD_MAX_EVENTS 10
 #endif
 
+#ifndef HTTPD_MAX_BINDS
+#define HTTPD_MAX_BINDS 4
+#endif
+
 #ifdef HTTPD_ELOG
 void httpd_elog(const char *format, ...) {
   char time_buf[32];
@@ -278,7 +282,7 @@ HttpdAddress httpd_address_unx(HttpdStr path) {
   return addr;
 }
 
-HttpdAddress httpd_address_url(HttpdStr url) {
+HttpdAddress httpd_address_parse(HttpdStr url) {
   const HttpdStr unx = STR("unix://");
   const HttpdStr tcp = STR("tcp://");
   const HttpdStr tcp6 = STR("tcp6://");
@@ -318,9 +322,7 @@ typedef struct {
   int fd;
 } HttpdConnection;
 
-int httpd_connection_connect(HttpdConnection *conn, HttpdAddress addr) {
-  conn->addr = addr;
-  conn->fd = -1;
+int httpd_connect(HttpdAddress addr) {
   int fd;
   TRY(fd = socket(addr.domain, SOCK_STREAM | SOCK_NONBLOCK, 0));
   socklen_t socklen = httpd_address_len(&addr);
@@ -333,24 +335,33 @@ int httpd_connection_connect(HttpdConnection *conn, HttpdAddress addr) {
   }
   TRY_CATCH(bind(fd, &addr.address, socklen), close(fd));
   TRY_CATCH(listen(fd, HTTPD_LISTEN_BACKLOG), close(fd));
-  conn->fd = fd;
+  return fd;
+}
+
+int httpd_connection_connect(HttpdConnection *conn, HttpdAddress addr) {
+  conn->addr = addr;
+  TRY(conn->fd = httpd_connect(addr));
   return 0;
 }
 
-int httpd_connection_accept(HttpdConnection *conn) {
-  int fd, flags;
-  HttpdAddress peer = {.domain = conn->addr.domain};
-  socklen_t addr_len = httpd_address_len(&peer);
-  TRY(fd = accept(conn->fd, &peer.address, &addr_len));
-  TRY(flags = fcntl(fd, F_GETFL, 0));
-  TRY(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
+int httpd_accept(int fd) {
+  int client_fd, flags, domain;
+  socklen_t len = sizeof(domain);
+  TRY(getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &len));
 
-  if (conn->addr.domain == AF_UNIX) {
+  HttpdAddress peer = {.domain = domain};
+  socklen_t addr_len = httpd_address_len(&peer);
+  TRY(client_fd = accept(fd, &peer.address, &addr_len));
+  TRY_CATCH(flags = fcntl(client_fd, F_GETFL, 0), close(client_fd));
+  TRY_CATCH(fcntl(client_fd, F_SETFL, flags | O_NONBLOCK), close(client_fd));
+
+  if (domain == AF_UNIX) {
     httpd_elog("Received connection from %s", peer.unx.sun_path);
   } else {
-    TRY_CATCH(httpd_isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
+    TRY_CATCH(httpd_isetsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, 1),
+              close(client_fd));
     char buf[128];
-    if (conn->addr.domain == AF_INET) {
+    if (domain == AF_INET) {
       inet_ntop(AF_INET, &peer.inet.sin_addr, buf, sizeof(buf));
       httpd_elog("Received connection from %s:%d\n", buf, peer.inet.sin_port);
     } else {
@@ -358,7 +369,11 @@ int httpd_connection_accept(HttpdConnection *conn) {
       httpd_elog("Received connection from %s:%d\n", buf, peer.inet6.sin6_port);
     }
   }
-  return fd;
+  return client_fd;
+}
+
+int httpd_connection_accept(HttpdConnection *conn) {
+  return httpd_accept(conn->fd);
 }
 
 void httpd_connection_close(HttpdConnection *conn) {
@@ -621,26 +636,46 @@ HttpdRequestHandler HttpdRouter_find(HttpdRouter *router, HttpdRequest *req) {
 // HttpdServer  --------------------------------------------------------------
 
 typedef struct {
-  HttpdConnection connection;
   int epoll_fd;
+  int size;
+  HttpdConnection connections[HTTPD_MAX_BINDS];
+} HttpdConnections;
 
+typedef struct {
   HttpdRouter router;
+  HttpdConnections connections;
+  int epoll_fd;
 } HttpdServer;
 
-int httpd_server_init(HttpdServer *server, HttpdConnection conn) {
-  int epoll_fd;
-  TRY(epoll_fd = epoll_create1(0));
-  server->connection = conn;
-  server->epoll_fd = epoll_fd;
+int httpd_server_init(HttpdServer *server, HttpdRouter router) {
+  server->router = router;
+  TRY(server->epoll_fd = epoll_create1(0));
+  server->connections.size = 0;
+  TRY(server->connections.epoll_fd = epoll_create1(0));
   struct epoll_event event = {.events = EPOLLIN,
-                              .data = {.fd = server->connection.fd}};
-  TRY_CATCH(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server->connection.fd, &event),
-            { close(epoll_fd); });
+                              .data = {.fd = server->connections.epoll_fd}};
+  TRY(epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, server->connections.epoll_fd,
+                &event));
+  return 0;
+}
+
+int httpd_server_bind(HttpdServer *server, HttpdAddress address) {
+  int i = server->connections.size;
+  HttpdConnection *conn = &server->connections.connections[i];
+  TRY(httpd_connection_connect(conn, address));
+  server->connections.size++;
+  struct epoll_event event = {.events = EPOLLIN, .data = {.ptr = conn}};
+  TRY(epoll_ctl(server->connections.epoll_fd, EPOLL_CTL_ADD, conn->fd, &event));
   return 0;
 }
 
 void httpd_server_close(HttpdServer *s) {
-  httpd_connection_close(&s->connection);
+  for (int i = 0; i < s->connections.size; ++i) {
+    httpd_connection_close(&s->connections.connections[i]);
+  }
+  if (s->connections.epoll_fd > 0) {
+    close(s->connections.epoll_fd);
+  }
   if (s->epoll_fd > 0) {
     close(s->epoll_fd);
     s->epoll_fd = 0;
@@ -700,9 +735,12 @@ int httpd_server_run(HttpdServer *s) {
     TRY(n = epoll_wait(s->epoll_fd, events, HTTPD_MAX_EVENTS, -1));
     for (int i = 0; i < n; ++i) {
       int fd = events[i].data.fd;
-      if (fd == s->connection.fd) {
+      if (fd == s->connections.epoll_fd) {
         int client_fd;
-        TRY_CATCH(client_fd = httpd_connection_accept(&s->connection),
+        struct epoll_event event;
+        TRY(epoll_wait(s->connections.epoll_fd, &event, 1, -1));
+        HttpdConnection *conn = (HttpdConnection *)event.data.ptr;
+        TRY_CATCH(client_fd = httpd_connection_accept(conn),
                   perror("Accept error"));
         TRY(httpd_server_add_client(s, client_fd));
       } else {

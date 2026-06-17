@@ -1,4 +1,4 @@
-//#define HTTPD_ELOG
+// #define HTTPD_ELOG
 #define HTTPD_IMPLEMENTATION
 
 #include "httpd.h"
@@ -97,11 +97,11 @@ int not_found(HttpdRequest *request) {
   return httpd_request_send_static(request, S404, MIME_HTML, content);
 }
 
-int run(HttpdAddress addr) {
+int main(int argc, char **argv) {
   httpd_elog("Starting httpd...\n");
+  HttpdAddress addr = httpd_address_parse(STR("tcp://127.0.0.1:3210"));
 
-  HttpdServer serv;
-  serv.router = (HttpdRouter){
+  HttpdRouter router = {
       .routes =
           (HttpdRoute[]){
               {.handler = home_page, .method = METHOD_GET, .path = STR("/")},
@@ -119,19 +119,12 @@ int run(HttpdAddress addr) {
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
 
-  HttpdConnection conn;
-  TRY_CATCH(httpd_connection_connect(&conn, addr), perror("Connect"));
-  TRY_CATCH(httpd_server_init(&serv, conn), perror("HttpdServer init"));
-
+  HttpdServer serv;
+  TRY_CATCH(httpd_server_init(&serv, router), perror("HttpdServer init"));
+  TRY_CATCH(httpd_server_bind(&serv, addr), perror("HttpdServer bind"));
   httpd_elog("Ready to receive requests\n");
   httpd_server_run(&serv);
   httpd_server_close(&serv);
   httpd_elog("Finished httpd\n");
   return 0;
-}
-
-int main(int argc, char **argv) {
-  HttpdAddress addr = httpd_address_url(STR("tcp://127.0.0.1:3210"));
-
-  return run(addr);
 }
