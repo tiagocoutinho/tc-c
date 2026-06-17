@@ -59,7 +59,8 @@ int info_page(HttpdRequest *request) {
   return httpd_request_send_static(request, S200, MIME_HTML, response);
 }
 
-int run(HttpdAddress addr) {
+int main(int argc, char **argv) {
+  HttpdAddress addr = httpd_address_parse(STR("tcp://127.0.0.1:3210"));
   httpd_elog("Starting httpd...\n");
 
   HttpdRouter router = {
@@ -83,7 +84,3 @@ int run(HttpdAddress addr) {
   return 0;
 }
 
-int main(int argc, char **argv) {
-  HttpdAddress addr = httpd_address_parse(STR("tcp://127.0.0.1:3210"));
-  return run(addr);
-}

@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <bits/time.h>
+#include <err.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -315,17 +316,9 @@ int httpd_address_len(HttpdAddress *address) {
   return sizeof(address->unx);
 }
 
-// HttpdConnection -----------------------------------------------------------
-
-typedef struct {
-  HttpdAddress addr;
-  int fd;
-} HttpdConnection;
-
-int httpd_connect(HttpdAddress addr) {
+int httpd_bind(HttpdAddress addr) {
   int fd;
   TRY(fd = socket(addr.domain, SOCK_STREAM | SOCK_NONBLOCK, 0));
-  socklen_t socklen = httpd_address_len(&addr);
   if (addr.domain == AF_UNIX) {
     unlink(addr.unx.sun_path);
   } else {
@@ -333,15 +326,10 @@ int httpd_connect(HttpdAddress addr) {
     TRY_CATCH(httpd_isetsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1), close(fd));
     TRY_CATCH(httpd_isetsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1), close(fd));
   }
+  socklen_t socklen = httpd_address_len(&addr);
   TRY_CATCH(bind(fd, &addr.address, socklen), close(fd));
   TRY_CATCH(listen(fd, HTTPD_LISTEN_BACKLOG), close(fd));
   return fd;
-}
-
-int httpd_connection_connect(HttpdConnection *conn, HttpdAddress addr) {
-  conn->addr = addr;
-  TRY(conn->fd = httpd_connect(addr));
-  return 0;
 }
 
 int httpd_accept(int fd) {
@@ -370,15 +358,6 @@ int httpd_accept(int fd) {
     }
   }
   return client_fd;
-}
-
-int httpd_connection_accept(HttpdConnection *conn) {
-  return httpd_accept(conn->fd);
-}
-
-void httpd_connection_close(HttpdConnection *conn) {
-  close(conn->fd);
-  conn->fd = -1;
 }
 
 // HTTP ----------------------------------------------------------------------
@@ -638,7 +617,7 @@ HttpdRequestHandler HttpdRouter_find(HttpdRouter *router, HttpdRequest *req) {
 typedef struct {
   int epoll_fd;
   int size;
-  HttpdConnection connections[HTTPD_MAX_BINDS];
+  int connections[HTTPD_MAX_BINDS];
 } HttpdConnections;
 
 typedef struct {
@@ -661,17 +640,22 @@ int httpd_server_init(HttpdServer *server, HttpdRouter router) {
 
 int httpd_server_bind(HttpdServer *server, HttpdAddress address) {
   int i = server->connections.size;
-  HttpdConnection *conn = &server->connections.connections[i];
-  TRY(httpd_connection_connect(conn, address));
+  if (i >= HTTPD_MAX_BINDS) {
+    warnx("Max bind exceeded. Ignoring...");
+    return 0;
+  }
+  int fd; // = &server->connections.connections[i];
+  TRY(fd = httpd_bind(address));
+  server->connections.connections[i] = fd;
   server->connections.size++;
-  struct epoll_event event = {.events = EPOLLIN, .data = {.ptr = conn}};
-  TRY(epoll_ctl(server->connections.epoll_fd, EPOLL_CTL_ADD, conn->fd, &event));
+  struct epoll_event event = {.events = EPOLLIN, .data = {.fd = fd}};
+  TRY(epoll_ctl(server->connections.epoll_fd, EPOLL_CTL_ADD, fd, &event));
   return 0;
 }
 
 void httpd_server_close(HttpdServer *s) {
   for (int i = 0; i < s->connections.size; ++i) {
-    httpd_connection_close(&s->connections.connections[i]);
+    close(s->connections.connections[i]);
   }
   if (s->connections.epoll_fd > 0) {
     close(s->connections.epoll_fd);
@@ -739,8 +723,7 @@ int httpd_server_run(HttpdServer *s) {
         int client_fd;
         struct epoll_event event;
         TRY(epoll_wait(s->connections.epoll_fd, &event, 1, -1));
-        HttpdConnection *conn = (HttpdConnection *)event.data.ptr;
-        TRY_CATCH(client_fd = httpd_connection_accept(conn),
+        TRY_CATCH(client_fd = httpd_accept(event.data.fd),
                   perror("Accept error"));
         TRY(httpd_server_add_client(s, client_fd));
       } else {
