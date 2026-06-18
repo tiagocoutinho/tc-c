@@ -103,10 +103,13 @@ bool httpd_str_index(HttpdStr str, char c, size_t *index) {
 }
 
 bool httpd_str_rindex(HttpdStr str, char c, size_t *index) {
-  for (size_t i = str.size - 1; i >= 0; --i) {
+  for (size_t i = str.size - 1;; --i) {
     if (str.data[i] == c) {
       *index = i;
       return true;
+    }
+    if (i == 0) {
+      break;
     }
   }
   return false;
@@ -138,7 +141,7 @@ HttpdStr httpd_str_substr(HttpdStr str, HttpdStr sub) {
   return str;
 }
 
-void httpd_str_self_trim_left(HttpdStr *str, size_t n) {
+void httpd_str_self_ltrim(HttpdStr *str, size_t n) {
   if (n > str->size) {
     n = str->size;
   }
@@ -146,8 +149,8 @@ void httpd_str_self_trim_left(HttpdStr *str, size_t n) {
   str->size -= n;
 }
 
-HttpdStr httpd_str_trim_left(HttpdStr str, size_t n) {
-  httpd_str_self_trim_left(&str, n);
+HttpdStr httpd_str_ltrim(HttpdStr str, size_t n) {
+  httpd_str_self_ltrim(&str, n);
   return str;
 }
 
@@ -160,7 +163,7 @@ HttpdStr httpd_str_strip_left(HttpdStr str) {
   while (i < n && str.data[i] == ' ') {
     i += 1;
   }
-  return httpd_str_trim_left(str, i);
+  return httpd_str_ltrim(str, i);
 }
 
 HttpdStr httpd_str_strip_right(HttpdStr str) {
@@ -175,7 +178,7 @@ HttpdStr httpd_str_strip(HttpdStr str) {
   return httpd_str_strip_right(httpd_str_strip_left(str));
 }
 
-bool httpd_str_starts_with(HttpdStr str, HttpdStr prefix) {
+bool httpd_str_startswith(HttpdStr str, HttpdStr prefix) {
   if (prefix.size <= str.size) {
     HttpdStr actual_prefix = httpd_str_from_parts(str.data, prefix.size);
     return httpd_str_eq(actual_prefix, prefix);
@@ -183,7 +186,7 @@ bool httpd_str_starts_with(HttpdStr str, HttpdStr prefix) {
   return false;
 }
 
-bool httpd_str_ends_with(HttpdStr str, HttpdStr suffix) {
+bool httpd_str_endswith(HttpdStr str, HttpdStr suffix) {
   if (suffix.size <= str.size) {
     HttpdStr actual_suffix =
         httpd_str_from_parts(str.data + str.size - suffix.size, suffix.size);
@@ -287,22 +290,28 @@ HttpdAddress httpd_address_parse(HttpdStr url) {
   const HttpdStr unx = STR("unix://");
   const HttpdStr tcp = STR("tcp://");
   const HttpdStr tcp6 = STR("tcp6://");
-  if (httpd_str_starts_with(url, unx)) {
-    HttpdStr path = httpd_str_trim_left(url, unx.size);
+  if (httpd_str_startswith(url, unx)) {
+    HttpdStr path = httpd_str_ltrim(url, unx.size);
     return httpd_address_unx(path);
-  } else if (httpd_str_starts_with(url, tcp6)) {
-    url = httpd_str_trim_left(url, tcp6.size);
+  } else if (httpd_str_startswith(url, tcp6)) {
+    url = httpd_str_ltrim(url, tcp6.size);
     size_t index = 0;
     httpd_str_rindex(url, ':', &index);
-    const HttpdStr host = httpd_str_from_parts(url.data, index);
     const int port = atoi(url.data + index + 1);
+
+    char buf[64] = {0};
+    memcpy(buf, url.data, index);
+    HttpdStr host = httpd_str_from_parts(buf, index);
     return httpd_address_inet6(host, port);
   }
-  url = httpd_str_trim_left(url, tcp.size);
+  url = httpd_str_ltrim(url, tcp.size);
   size_t index = 0;
   httpd_str_index(url, ':', &index);
-  const HttpdStr host = httpd_str_from_parts(url.data, index);
   const int port = atoi(url.data + index + 1);
+
+  char buf[64] = {0};
+  memcpy(buf, url.data, index);
+  HttpdStr host = httpd_str_from_parts(buf, index);
   return httpd_address_inet(host, port);
 }
 
@@ -329,6 +338,27 @@ int httpd_bind(HttpdAddress addr) {
   socklen_t socklen = httpd_address_len(&addr);
   TRY_CATCH(bind(fd, &addr.address, socklen), close(fd));
   TRY_CATCH(listen(fd, HTTPD_LISTEN_BACKLOG), close(fd));
+
+#ifdef HTTPD_ELOG
+  char buf[256];
+  if (addr.domain == AF_INET) {
+    struct sockaddr_in address;
+    socklen_t size = sizeof(address);
+    getsockname(fd, (struct sockaddr *)&address, &size);
+    const char *name = inet_ntop(addr.domain, &address.sin_addr, buf, sizeof(buf));
+    httpd_elog("Ready to accept requests on TCP/IPv4 %s:%d\n", name,
+               ntohs(address.sin_port));
+  } else if (addr.domain == AF_INET6) {
+    struct sockaddr_in6 address;
+    socklen_t size = sizeof(address);
+    getsockname(fd, (struct sockaddr *)&address, &size);
+    const char *name = inet_ntop(addr.domain, &address.sin6_addr, buf, sizeof(buf));
+    httpd_elog("Ready to accept requests on TCP/IPv6 %s:%d\n", name,
+               ntohs(address.sin6_port));
+  } else {
+    httpd_elog("Ready to accept requests on UNIX %s\n", addr.unx.sun_path);
+  }
+#endif
   return fd;
 }
 
@@ -449,7 +479,7 @@ HttpdKeyValue httpd_iterator_next(HttpdIterator *q) {
   };
   HttpdStr raw_value = httpd_str_from_parts(q->data.data + field_sep + 1,
                                             field_end - field_sep - 1);
-  httpd_str_self_trim_left(&q->data, field_end + 1);
+  httpd_str_self_ltrim(&q->data, field_end + 1);
   size_t percent;
   if (httpd_str_index(raw_value, '%', &percent)) {
     char *out = q->_buf + q->_buf_size;
@@ -503,7 +533,7 @@ HttpdHeader httpd_header_iterator_next(HttpdHeaderIterator *it) {
                                  field_end - field_sep - 1);
   r.value = httpd_str_strip(r.value);
 
-  httpd_str_self_trim_left(&it->data, field_end + 2);
+  httpd_str_self_ltrim(&it->data, field_end + 2);
   return r;
 }
 
@@ -534,7 +564,7 @@ typedef struct {
 void httpd_request_parse_status_path(HttpdRequest *req) {
   size_t query_index = req->full_path.size;
   if (httpd_str_index(req->full_path, '?', &query_index)) {
-    req->query = httpd_str_trim_left(req->full_path, query_index + 1);
+    req->query = httpd_str_ltrim(req->full_path, query_index + 1);
   }
   req->path = httpd_str_from_parts(req->full_path.data, query_index);
 }
@@ -545,19 +575,18 @@ HttpdRequest httpd_request_new(HttpdStr data) {
                       .status_line = httpd_str_subc(data, '\r')};
   HttpdStr method = httpd_str_subc(req.status_line, ' ');
   req.method = httpd_method_parse(method);
-  HttpdStr rest_status_line =
-      httpd_str_trim_left(req.status_line, method.size + 1);
+  HttpdStr rest_status_line = httpd_str_ltrim(req.status_line, method.size + 1);
   req.full_path = httpd_str_subc(rest_status_line, ' ');
 
   httpd_request_parse_status_path(&req);
 
-  req.protocol = httpd_str_trim_left(rest_status_line, req.full_path.size + 1);
+  req.protocol = httpd_str_ltrim(rest_status_line, req.full_path.size + 1);
 
-  httpd_str_self_trim_left(&data, req.status_line.size + 2);
+  httpd_str_self_ltrim(&data, req.status_line.size + 2);
   size_t hb_index = 0;
   httpd_str_indexstr(data, HEADER_BODY_SEPARATOR, &hb_index);
   req.header = httpd_str_from_parts(data.data, hb_index + 2);
-  req.body = httpd_str_trim_left(data, hb_index + 4);
+  req.body = httpd_str_ltrim(data, hb_index + 4);
   return req;
 }
 
@@ -816,7 +845,7 @@ int httpd_raw_send_file(HttpdRequest *req, const char *filename,
 int httpd_request_send_file(HttpdRequest *req, HttpdStr filename) {
   HttpdStr etag = httpd_request_get_header(req, STR("If-None-Match"));
   HttpdStr mime = MIME_PLAIN;
-  if (httpd_str_ends_with(filename, STR(".html"))) {
+  if (httpd_str_endswith(filename, STR(".html"))) {
     mime = MIME_HTML;
   }
 

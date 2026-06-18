@@ -78,7 +78,10 @@ int main(int argc, char **argv) {
   TRY_CATCH(httpd_server_bind(&serv, addr1), perror("HttpdServer bind"));
   HttpdAddress addr2 = httpd_address_parse(STR("tcp://127.0.0.1:3211"));
   TRY_CATCH(httpd_server_bind(&serv, addr2), perror("HttpdServer bind"));
-  httpd_elog("Ready to receive requests\n");
+  HttpdAddress addr3 = httpd_address_parse(STR("tcp://127.0.0.1:0"));
+  TRY_CATCH(httpd_server_bind(&serv, addr3), perror("HttpdServer bind"));
+  HttpdAddress addr4 = httpd_address_parse(STR("tcp6://::1:3210"));
+  TRY_CATCH(httpd_server_bind(&serv, addr4), perror("HttpdServer bind"));
   httpd_server_run(&serv);
   httpd_server_close(&serv);
   httpd_elog("Finished httpd\n");

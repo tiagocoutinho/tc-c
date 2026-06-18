@@ -76,7 +76,6 @@ int main(int argc, char **argv) {
   HttpdServer serv;
   TRY_CATCH(httpd_server_init(&serv, router), perror("HttpdServer init"));
   TRY_CATCH(httpd_server_bind(&serv, addr), perror("HttpdServer bind"));
-  httpd_elog("Ready to receive requests\n");
   httpd_server_run(&serv);
   httpd_server_close(&serv);
   httpd_elog("Finished httpd\n");
