@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -5,6 +7,7 @@
 #include <arpa/inet.h>
 #include <bits/time.h>
 #include <err.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -33,6 +36,15 @@
 #ifndef HTTPD_MAX_BINDS
 #define HTTPD_MAX_BINDS 4
 #endif
+
+#ifndef HTTPD_HEADER_BUFFER_SIZE
+#define HTTPD_HEADER_BUFFER_SIZE 2048
+#endif
+
+#ifndef HTTPD_REQUEST_BUFFER_SIZE
+#define HTTPD_REQUEST_BUFFER_SIZE 8192
+#endif
+
 
 #ifdef HTTPD_ELOG
 void httpd_elog(const char *format, ...) {
@@ -254,7 +266,7 @@ typedef struct {
     struct sockaddr address;
     struct sockaddr_in inet;
     struct sockaddr_in6 inet6;
-    struct sockaddr_un unx;
+    struct sockaddr_un local;
   };
 } HttpdAddress;
 
@@ -278,21 +290,21 @@ HttpdAddress httpd_address_inet6(HttpdStr host, int port) {
   return addr;
 }
 
-HttpdAddress httpd_address_unx(HttpdStr path) {
+HttpdAddress httpd_address_local(HttpdStr path) {
   HttpdAddress addr = {.domain = AF_UNIX};
-  memset(&addr.unx, 0, sizeof(addr.unx));
-  addr.unx.sun_family = AF_UNIX;
-  strncpy(addr.unx.sun_path, path.data, path.size);
+  memset(&addr.local, 0, sizeof(addr.local));
+  addr.local.sun_family = AF_UNIX;
+  strncpy(addr.local.sun_path, path.data, path.size);
   return addr;
 }
 
 HttpdAddress httpd_address_parse(HttpdStr url) {
-  const HttpdStr unx = STR("unix://");
+  const HttpdStr local = STR("unix://");
   const HttpdStr tcp = STR("tcp://");
   const HttpdStr tcp6 = STR("tcp6://");
-  if (httpd_str_startswith(url, unx)) {
-    HttpdStr path = httpd_str_ltrim(url, unx.size);
-    return httpd_address_unx(path);
+  if (httpd_str_startswith(url, local)) {
+    HttpdStr path = httpd_str_ltrim(url, local.size);
+    return httpd_address_local(path);
   } else if (httpd_str_startswith(url, tcp6)) {
     url = httpd_str_ltrim(url, tcp6.size);
     size_t index = 0;
@@ -322,14 +334,14 @@ int httpd_address_len(HttpdAddress *address) {
   if (address->domain == AF_INET6) {
     return sizeof(address->inet6);
   }
-  return sizeof(address->unx);
+  return sizeof(address->local);
 }
 
 int httpd_bind(HttpdAddress addr) {
   int fd;
   TRY(fd = socket(addr.domain, SOCK_STREAM | SOCK_NONBLOCK, 0));
   if (addr.domain == AF_UNIX) {
-    unlink(addr.unx.sun_path);
+    unlink(addr.local.sun_path);
   } else {
     TRY_CATCH(httpd_isetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1), close(fd));
     TRY_CATCH(httpd_isetsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1), close(fd));
@@ -345,18 +357,20 @@ int httpd_bind(HttpdAddress addr) {
     struct sockaddr_in address;
     socklen_t size = sizeof(address);
     getsockname(fd, (struct sockaddr *)&address, &size);
-    const char *name = inet_ntop(addr.domain, &address.sin_addr, buf, sizeof(buf));
+    const char *name =
+        inet_ntop(addr.domain, &address.sin_addr, buf, sizeof(buf));
     httpd_elog("Ready to accept requests on TCP/IPv4 %s:%d\n", name,
                ntohs(address.sin_port));
   } else if (addr.domain == AF_INET6) {
     struct sockaddr_in6 address;
     socklen_t size = sizeof(address);
     getsockname(fd, (struct sockaddr *)&address, &size);
-    const char *name = inet_ntop(addr.domain, &address.sin6_addr, buf, sizeof(buf));
+    const char *name =
+        inet_ntop(addr.domain, &address.sin6_addr, buf, sizeof(buf));
     httpd_elog("Ready to accept requests on TCP/IPv6 %s:%d\n", name,
                ntohs(address.sin6_port));
   } else {
-    httpd_elog("Ready to accept requests on UNIX %s\n", addr.unx.sun_path);
+    httpd_elog("Ready to accept requests on UNIX %s\n", addr.local.sun_path);
   }
 #endif
   return fd;
@@ -374,7 +388,7 @@ int httpd_accept(int fd) {
   TRY_CATCH(fcntl(client_fd, F_SETFL, flags | O_NONBLOCK), close(client_fd));
 
   if (domain == AF_UNIX) {
-    httpd_elog("Received connection from %s", peer.unx.sun_path);
+    httpd_elog("Received connection from %s", peer.local.sun_path);
   } else {
     TRY_CATCH(httpd_isetsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, 1),
               close(client_fd));
@@ -409,11 +423,12 @@ typedef enum {
   METHOD_PATCH = 1 << 4,
   METHOD_HEAD = 1 << 5,
   METHOD_OPTIONS = 1 << 6,
+  METHOD_UNKNOWN = 1 << 15,
 } HttpdMethod;
 
-int httpd_method_parse(HttpdStr m) {
+HttpdMethod httpd_method_parse(HttpdStr m) {
   if (!m.size)
-    return 0;
+    return METHOD_UNKNOWN;
   if (httpd_str_eq(m, MGET))
     return METHOD_GET;
   if (httpd_str_eq(m, MPUT))
@@ -456,7 +471,7 @@ typedef struct {
 
 typedef struct {
   HttpdStr data;
-  char _buf[4096];
+  char _buf[HTTPD_HEADER_BUFFER_SIZE];
   size_t _buf_size;
 } HttpdIterator;
 
@@ -545,12 +560,15 @@ HttpdKeyValue (*const httpd_form_iterator_next)(HttpdIterator *) =
 
 // HttpdRequest --------------------------------------------------------------
 
+struct HttpdRoute_s;
+
 typedef struct {
   int fd;
+  struct HttpdRoute_s *route;
   HttpdStr payload;
 
   HttpdStr status_line;
-  int method;
+  HttpdMethod method;
 
   HttpdStr full_path;
   HttpdStr path;
@@ -561,6 +579,8 @@ typedef struct {
   HttpdStr body;
 } HttpdRequest;
 
+typedef int (*HttpdRequestHandler)(HttpdRequest *);
+
 void httpd_request_parse_status_path(HttpdRequest *req) {
   size_t query_index = req->full_path.size;
   if (httpd_str_index(req->full_path, '?', &query_index)) {
@@ -569,10 +589,10 @@ void httpd_request_parse_status_path(HttpdRequest *req) {
   req->path = httpd_str_from_parts(req->full_path.data, query_index);
 }
 
-HttpdRequest httpd_request_new(HttpdStr data) {
+HttpdRequest httpd_request_new(int fd, HttpdStr data) {
   // GET /path HTTP/1.1
-  HttpdRequest req = {.payload = data,
-                      .status_line = httpd_str_subc(data, '\r')};
+  HttpdRequest req = {
+      .fd = fd, .payload = data, .status_line = httpd_str_subc(data, '\r')};
   HttpdStr method = httpd_str_subc(req.status_line, ' ');
   req.method = httpd_method_parse(method);
   HttpdStr rest_status_line = httpd_str_ltrim(req.status_line, method.size + 1);
@@ -615,11 +635,10 @@ HttpdStr httpd_request_get_header(HttpdRequest *req, HttpdStr name) {
 
 // HttpdRouter ---------------------------------------------------------------
 
-typedef int (*HttpdRequestHandler)(HttpdRequest *);
-
-typedef struct {
-  int method;
+typedef struct HttpdRoute_s {
+  HttpdMethod method;
   HttpdStr path;
+  HttpdStr arg;
   HttpdRequestHandler handler;
 } HttpdRoute;
 
@@ -629,16 +648,17 @@ typedef struct {
   HttpdRoute NotFound;
 } HttpdRouter;
 
-HttpdRequestHandler HttpdRouter_find(HttpdRouter *router, HttpdRequest *req) {
+HttpdRoute *HttpdRouter_find(HttpdRouter *router, HttpdMethod method,
+                             HttpdStr path) {
   for (size_t i = 0; i < router->size; ++i) {
     const HttpdRoute *route = &router->routes[i];
-    if (!route->method || (req->method & route->method)) {
-      if (httpd_str_eq(req->path, router->routes[i].path)) {
-        return router->routes[i].handler;
+    if (!route->method || (method & route->method)) {
+      if (httpd_str_eq(path, router->routes[i].path)) {
+        return &router->routes[i];
       }
     }
   }
-  return router->NotFound.handler;
+  return &router->NotFound;
 }
 
 // HttpdServer  --------------------------------------------------------------
@@ -709,7 +729,7 @@ int httpd_server_remove_client(HttpdServer *s, int fd) {
 }
 
 int httpd_server_handle_request(HttpdServer *s, int fd) {
-  char rbuf[4096];
+  char rbuf[HTTPD_REQUEST_BUFFER_SIZE];
   int n;
   TRY(n = recv(fd, rbuf, sizeof(rbuf), 0));
   if (n == 0) {
@@ -723,21 +743,18 @@ int httpd_server_handle_request(HttpdServer *s, int fd) {
 #endif
 
   const HttpdStr payload = httpd_str_from_parts(rbuf, n);
-  HttpdRequest req = httpd_request_new(payload);
-  req.fd = fd;
-
+  HttpdRequest req = httpd_request_new(fd, payload);
+  req.route = HttpdRouter_find(&s->router, req.method, req.path);
 #ifdef HTTPD_ELOG
   httpd_elog(STR_Fmt " START\n", STR_Arg(req.status_line));
-  HttpdRequestHandler func = HttpdRouter_find(&s->router, &req);
-  int result = func(&req);
+  int result = req.route->handler(&req);
   clock_gettime(CLOCK_MONOTONIC, &end);
   HttpdStr dt = httpd_time_delta(&start, &end, logbuf, sizeof(logbuf));
   httpd_elog(STR_Fmt " END " STR_Fmt "\n", STR_Arg(req.status_line),
              STR_Arg(dt));
   return result;
 #else
-  HttpdRequestHandler func = HttpdRouter_find(&s->router, &req);
-  return func(&req);
+  return req.route->handler(&req);
 #endif
 }
 
@@ -759,7 +776,7 @@ int httpd_server_run(HttpdServer *s) {
         const int result = httpd_server_handle_request(s, fd);
         if (result < 0) {
           if (result == -1) {
-            perror("Handle error");
+            httpd_elog("Handle error: %s\n", strerrordesc_np(errno));
           }
           httpd_server_remove_client(s, fd);
           close(fd);
@@ -790,7 +807,7 @@ int httpd_request_send_headers(HttpdRequest *req, HttpdStatus status,
                                HttpdStr content_type, size_t content_size,
                                HttpdStr extra_headers) {
 
-  char write_buf[4096];
+  char write_buf[HTTPD_HEADER_BUFFER_SIZE];
   char *buf = write_buf;
   buf += sprintf(buf, STR_Fmt " %d " STR_Fmt CRLF, STR_Arg(req->protocol),
                  status.status_code, STR_Arg(status.message));
@@ -818,9 +835,9 @@ HttpdStr _httpd_file_etag(char *buf, struct stat *s) {
   return httpd_str_from_parts(buf, n);
 }
 
-int httpd_raw_send_file(HttpdRequest *req, const char *filename,
-                        HttpdStatus status, HttpdStr content_type,
-                        HttpdStr request_etag) {
+int httpd_request_raw_send_file(HttpdRequest *req, const char *filename,
+                                HttpdStatus status, HttpdStr content_type,
+                                HttpdStr request_etag) {
   int src_fd, result;
   char _etag[64], _etag_header[96];
   struct stat s;
@@ -849,7 +866,33 @@ int httpd_request_send_file(HttpdRequest *req, HttpdStr filename) {
     mime = MIME_HTML;
   }
 
-  return httpd_raw_send_file(req, filename.data, S200, mime, etag);
+  return httpd_request_raw_send_file(req, filename.data, S200, mime, etag);
+}
+
+int httpd_request_route_send_file(HttpdRequest *req) {
+  return httpd_request_send_file(req, req->route->arg);
+}
+
+int httpd_route_send_static_html(HttpdRequest *req) {
+  return httpd_request_send_static(req, S200, MIME_HTML, req->route->arg);
+}
+
+HttpdRoute httpd_route_static_html(HttpdStr path, HttpdStr content) {
+  return (HttpdRoute){
+      .method = METHOD_GET,
+      .path = path,
+      .arg = content,
+      .handler = httpd_route_send_static_html,
+  };
+}
+
+HttpdRoute httpd_route_static_file(HttpdStr path, HttpdStr filename) {
+  return (HttpdRoute){
+      .method = METHOD_GET,
+      .path = path,
+      .arg = filename,
+      .handler = httpd_request_route_send_file,
+  };
 }
 
 #ifdef _HTTPD_TRY

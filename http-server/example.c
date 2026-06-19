@@ -1,25 +1,18 @@
 #define HTTPD_IMPLEMENTATION
 #include "httpd.h"
 
-int about_page(HttpdRequest *request) {
-  return httpd_request_send_file(request, STR("about.html"));
-}
-
-int home_page(HttpdRequest *request) {
-  HttpdStr content = STR("<!DOCTYPE html>"
+const char home_page[] = "<!DOCTYPE html>"
                          "<html>"
                          "<head><link rel=\"icon\" href=\"data:,\" /></head>"
                          "<body><h1>Hello, world!</h1></body>"
-                         "</html>");
-  return httpd_request_send_static(request, S200, MIME_HTML, content);
-}
+                         "</html>";
 
 int not_found(HttpdRequest *request) {
-  HttpdStr content = STR("<html>"
+  const char content[] = "<html>"
                          "<head><link rel=\"icon\" href=\"data:,\" /></head>"
                          "<body><h1>404 Not found</h1></body>"
-                         "</html>");
-  return httpd_request_send_static(request, S404, MIME_HTML, content);
+                         "</html>";
+  return httpd_request_send_static(request, S404, MIME_HTML, STR(content));
 }
 
 int info_page(HttpdRequest *request) {
@@ -59,15 +52,15 @@ int info_page(HttpdRequest *request) {
 }
 
 int main(int argc, char **argv) {
-  HttpdAddress addr = httpd_address_parse(STR("tcp://127.0.0.1:3210"));
+  HttpdAddress addr = httpd_address_parse(STR("tcp://0.0.0.0:3210"));
   httpd_elog("Starting httpd...\n");
 
   HttpdRouter router = {
       .routes =
           (HttpdRoute[]){
-              {.handler = home_page, .path = STR("/")},
-              {.handler = about_page, .path = STR("/about")},
+              httpd_route_static_html(STR("/"), STR(home_page)),
               {.handler = info_page, .path = STR("/info")},
+              httpd_route_static_file(STR("/about"), STR("about.html")),
           },
       .size = 3,
       .NotFound = {.handler = not_found, .path = STR_NULL},
@@ -81,4 +74,3 @@ int main(int argc, char **argv) {
   httpd_elog("Finished httpd\n");
   return 0;
 }
-
