@@ -34,7 +34,6 @@ HttpdStr home_page = STR("<html><body><h1>Hello, world!</h1></body></html>");
 HttpdStr not_found = STR("<html><body><h3>404 Not Found</h3></body></html>");
 
 int main(int argc, char **argv) {
-  HttpdAddress addr = httpd_address_parse(STR("tcp://127.0.0.1:3210"));
   HttpdRouter router = {
       .routes =
           (HttpdRoute[]){
@@ -42,17 +41,93 @@ int main(int argc, char **argv) {
           },
       .size = 1,
       .NotFound = httpd_route_static_html(STR_NULL, not_found),
-  };
+  }
 
   HttpdServer serv;
   TRY_CATCH(httpd_server_init(&serv, router), perror("HttpdServer init"));
+  
+  HttpdAddress addr = httpd_address_parse(STR("tcp://127.0.0.1:3210"));
   TRY_CATCH(httpd_server_bind(&serv, addr), perror("HttpdServer bind"));
+  
   httpd_server_run(&serv);
   httpd_server_close(&serv);
   return 0;
 }
 
 ```
+### Router
+
+The example above initializes a router with a helper for "/" to render static HTML content from a string.
+
+If dynamic content is needed, you can define a handler function like:
+
+```c
+
+int about_page(HttpdRequest *req) {
+    HttpdSr about = STR("<html><body><h1>About</h1></body></html>")
+    return httpd_request_send_static(request, S200, MIME_HTML, about);
+}
+```
+
+And register it:
+
+```c
+  HttpdRouter router = {
+      .routes =
+          (HttpdRoute[]){
+              httpd_route_static_html(STR("/"), home_page),
+              .{.path = STR("/about"), .handler = about_page)},
+          },
+      .size = 2,
+      .NotFound = httpd_route_static_html(STR_NULL, not_found),
+  }
+```
+
+### Bind on different addresses
+
+#### Local (UNIX) socket
+
+```c
+HttpdAddress addr = httpd_address_parse(STR("unix:///tmp/httpd.sock"));
+```
+
+#### IPv6
+
+```c
+HttpdAddress addr = httpd_address_parse(STR("tcp6://::1:3210"));
+```
+
+#### Find free port
+
+```c
+HttpdAddress addr = httpd_address_parse(STR("tcp6://127.0.0.1:0"));
+```
+
+### Multiple bind
+
+Supports multiple binds. By default max is 4 but it can be changed by
+setting `#define HTTPD_MAX_BINDS 8` before including `httpd.h`.
+
+```c
+#define HTTPD_IMPLEMENTATION
+#define HTTPD_MAX_BINDS 6
+#include "httpd.h"
+
+...
+
+HttpdAddress addr1 = httpd_address_parse(STR("tcp://0.0.0.0:3210"));
+TRY_CATCH(httpd_server_bind(&serv, addr1), perror("HttpdServer bind TCP 3210 error"));
+
+HttpdAddress addr2 = httpd_address_parse(STR("tcp://0.0.0.0:3211"));
+TRY_CATCH(httpd_server_bind(&serv, addr2), perror("HttpdServer bind TCP 3211 error"));
+
+HttpdAddress addr3 = httpd_address_parse(STR("unix:///tmp/httpd.sock"));
+TRY_CATCH(httpd_server_bind(&serv, addr3), perror("HttpdServer bind Unix error"));
+
+HttpdAddress addr4 = httpd_address_parse(STR("tcp6://::1:3210"));
+TRY_CATCH(httpd_server_bind(&serv, addr4), perror("HttpdServer bind IPv6 error"));
+```
+
 
 
 ## Examples
