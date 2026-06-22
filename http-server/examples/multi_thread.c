@@ -32,7 +32,7 @@ int run(HttpdAddress addr) {
       .NotFound = {.handler = not_found, .path = STR_NULL},
   };
   HttpdServer serv;
-  TRY_CATCH(httpd_server_init(&serv, router), perror("HttpdServer init"));
+  TRY_CATCH(httpd_server_init(&serv, router, NULL), perror("HttpdServer init"));
   TRY_CATCH(httpd_server_bind(&serv, addr), perror("HttpdServer bind"));
 
   httpd_elog("Ready to receive requests\n");

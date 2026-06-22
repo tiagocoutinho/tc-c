@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
   };
 
   HttpdServer serv;
-  TRY_CATCH(httpd_server_init(&serv, router), perror("HttpdServer init"));
+  TRY_CATCH(httpd_server_init(&serv, router, NULL), perror("HttpdServer init"));
   HttpdAddress addr1 = httpd_address_parse(STR("tcp://127.0.0.1:3210"));
   TRY_CATCH(httpd_server_bind(&serv, addr1), perror("HttpdServer bind"));
   HttpdAddress addr2 = httpd_address_parse(STR("tcp://127.0.0.1:3211"));
