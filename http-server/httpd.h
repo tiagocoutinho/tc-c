@@ -462,6 +462,7 @@ const HttpdStatus S304 = {s304, STR("Not Modifified")};
 const HttpdStatus S404 = {s404, STR("Not Found")};
 const HttpdStr MIME_PLAIN = STR("text/plain");
 const HttpdStr MIME_HTML = STR("text/html");
+const HttpdStr MIME_JSON = STR("application/json");
 const HttpdStr HEADER_BODY_SEPARATOR = STR("\r\n\r\n");
 
 typedef struct {
@@ -565,6 +566,7 @@ struct HttpdRoute_s;
 typedef struct {
   int fd;
   struct HttpdRoute_s *route;
+  void* app;
   HttpdStr payload;
 
   HttpdStr status_line;
@@ -589,10 +591,10 @@ void httpd_request_parse_status_path(HttpdRequest *req) {
   req->path = httpd_str_from_parts(req->full_path.data, query_index);
 }
 
-HttpdRequest httpd_request_new(int fd, HttpdStr data) {
+HttpdRequest httpd_request_new(int fd, void* app, HttpdStr data) {
   // GET /path HTTP/1.1
   HttpdRequest req = {
-      .fd = fd, .payload = data, .status_line = httpd_str_subc(data, '\r')};
+      .fd = fd, .app = app, .payload = data, .status_line = httpd_str_subc(data, '\r')};
   HttpdStr method = httpd_str_subc(req.status_line, ' ');
   req.method = httpd_method_parse(method);
   HttpdStr rest_status_line = httpd_str_ltrim(req.status_line, method.size + 1);
@@ -673,10 +675,12 @@ typedef struct {
   HttpdRouter router;
   HttpdConnections connections;
   int epoll_fd;
+  void* app;
 } HttpdServer;
 
-int httpd_server_init(HttpdServer *server, HttpdRouter router) {
+int httpd_server_init(HttpdServer *server, HttpdRouter router, void* app) {
   server->router = router;
+  server->app = app;
   TRY(server->epoll_fd = epoll_create1(0));
   server->connections.size = 0;
   TRY(server->connections.epoll_fd = epoll_create1(0));
@@ -743,7 +747,7 @@ int httpd_server_handle_request(HttpdServer *s, int fd) {
 #endif
 
   const HttpdStr payload = httpd_str_from_parts(rbuf, n);
-  HttpdRequest req = httpd_request_new(fd, payload);
+  HttpdRequest req = httpd_request_new(fd, s->app, payload);
   req.route = HttpdRouter_find(&s->router, req.method, req.path);
 #ifdef HTTPD_ELOG
   httpd_elog(STR_Fmt " START\n", STR_Arg(req.status_line));
